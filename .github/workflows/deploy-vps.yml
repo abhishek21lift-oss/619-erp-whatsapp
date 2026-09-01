@@ -40,12 +40,15 @@ jobs:
             docker compose config --services | grep -qx 'redis'
             docker compose config --services | grep -qx 'backend'
 
-            # Resolve the actual network used by the already-running backend.
-            # The gateway must join this exact network so Docker DNS can resolve
-            # both `redis` and `myptstudio-backend` without changing production
-            # services or guessing the Compose project/network name.
-            WA_NETWORK_NAME="$(docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' myptstudio-backend | head -n 1)"
+            # Resolve the exact production network shared by Redis and backend.
+            # Do not use the first backend network because backend also belongs
+            # to the separate ai-gateway network.
+            WA_NETWORK_NAME="$(docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' myptstudio-redis | head -n 1)"
             [ -n "$WA_NETWORK_NAME" ]
+            if ! docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' myptstudio-backend | grep -Fxq "$WA_NETWORK_NAME"; then
+              echo "Redis and backend are not sharing the resolved network: $WA_NETWORK_NAME"
+              exit 1
+            fi
             export WA_NETWORK_NAME
             echo "Using existing ERP Docker network: $WA_NETWORK_NAME"
 
