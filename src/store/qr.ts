@@ -27,7 +27,13 @@ export interface QrReader {
   clear(instanceId: string): Promise<void>;
 }
 
-export class QrStore implements QrReader {
+/** The write side, used only by the connector. */
+export interface QrWriter {
+  set(instanceId: string, qr: string): Promise<void>;
+  clear(instanceId: string): Promise<void>;
+}
+
+export class QrStore implements QrReader, QrWriter {
   readonly #redis: Redis;
   readonly #ttlSec: number;
 

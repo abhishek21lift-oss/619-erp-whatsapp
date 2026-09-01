@@ -778,6 +778,30 @@ Migration number **185**. (184 is the highest currently used; note 174/175/176
 already have duplicate numbering in the repo, so the next free number is not
 simply "one more than the count of files".)
 
+### 12.4 Why the session store is hand-written *(added in Phase 3)*
+
+Baileys ships `useMultiFileAuthState`, and its own doc comment says:
+
+> *"I wouldn't endorse this for any production level use other than perhaps a
+> bot. Would recommend writing an auth state for use with a proper SQL or
+> No-SQL DB"*
+
+We are deliberately not using a database (§12.1), so the answer is to write the
+file-backed store properly rather than accept a helper its own authors flag as
+unsuitable. `src/store/authState.ts` differs in three concrete ways, each of
+which is a real failure this service would otherwise inherit:
+
+| | Baileys' helper | Ours |
+|---|---|---|
+| Write | `writeFile` — a kill mid-write leaves truncated JSON, and a truncated `creds.json` is an unrecoverable session (§13.2) | temp + `fsync` + `rename`: a kill at any instant leaves either the old file or the new one |
+| Locking | a module-level `Map` of one mutex per file path, never evicted — pre-key files churn constantly, so it grows for the life of the process | one serializer per instance, bounded by `WA_MAX_INSTANCES` |
+| Filenames | maps `/` and `:` out of the way; does not refuse `..` or bound length | validates and refuses; long ids truncated with a hash suffix so they stay injective |
+
+The `/` → `__` and `:` → `-` substitutions are kept **identical** on purpose: a
+session directory written by Baileys' helper stays readable by ours, which is
+the difference between swapping an implementation and forcing every studio to
+re-scan a QR.
+
 ---
 
 ## 13. Failure handling
@@ -1231,17 +1255,47 @@ that measurement rather than from a guess.
 
 - Baileys' API changes across minor versions — the ERP is insulated because it
   only ever sees this service's REST contract.
-- Full history sync on first connect can be large; the MVP **disables history
-  sync** (`shouldSyncHistoryMessage: () => false`). The MVP does not read
-  history, and syncing it would spend memory and bandwidth on data with nowhere
-  to go.
+- Full history sync on first connect can be large, so the MVP sets
+  `syncFullHistory: false`.
+
+  > **Corrected in Phase 3.** This bullet originally also called for
+  > `shouldSyncHistoryMessage: () => false`. Baileys 7 logs, on every socket
+  > where that is set:
+  >
+  > *"DANGER: DISABLING ALL SYNC BY shouldSyncHistoryMsg PREVENTS BAILEYS FROM
+  > ACCESSING INITIAL LID MAPPINGS, LEADING TO INSTABILITY AND SESSION ERRORS"*
+  >
+  > LID mappings are how Baileys 7 resolves a contact's real identity, so
+  > suppressing them trades a little bandwidth for sessions that fail in ways
+  > that are hard to diagnose. `syncFullHistory: false` already bounds the
+  > volume, which was the actual goal. The override is **not** set.
+
+- **A socket that never connects may produce no event at all.** Discovered in
+  Phase 3 by running the service against a network that blocks WhatsApp: the
+  WebSocket was refused in under 100 ms and Baileys emitted no
+  `connection.update` whatsoever — no QR, no close, no error. The instance sat
+  in `connecting` indefinitely.
+
+  Baileys' own `connectTimeoutMs` did not rescue it, so the connector arms its
+  own watchdog (`WA_CONNECT_TIMEOUT_MS`, default 45 s), cleared by the first
+  QR or `open`. On expiry the instance goes to `failed` with
+  `last_error_code: connect_timeout` and emits
+  `whatsapp.instance.disconnected`. Without it, the first time the VPS loses
+  egress to WhatsApp every studio would watch a spinner forever while the
+  backend polled a state that could never change.
+
+- `markOnlineOnConnect` defaults to **true** and is set to **false**. Left on,
+  the gateway registers as an active online client and WhatsApp stops pushing
+  notifications to the studio owner's own phone — they would silently stop
+  hearing from their own clients.
+
 - No official support. The community is the support channel.
-- **Exact export names must be verified against the installed package in Phase 2.**
-  This document deliberately describes the auth-state adapter by its shape —
-  something providing `state` plus a `saveCreds` callback — rather than naming a
-  helper from memory. Symbol names have moved between Baileys versions, and a
-  design document asserting one it has not verified is worse than one that says
-  so.
+
+- ~~Exact export names must be verified against the installed package.~~
+  **Done in Phase 3**, against `baileys@7.0.0-rc14`:
+  `makeWASocket`, `DisconnectReason`, `Browsers`, `initAuthCreds`, `BufferJSON`,
+  `proto`, `fetchLatestBaileysVersion` and `useMultiFileAuthState` all exist as
+  assumed. `useMultiFileAuthState` is **not used** — see §12.4.
 
 ---
 
@@ -1499,6 +1553,8 @@ ALTER TABLE communication_logs ADD COLUMN IF NOT EXISTS provider TEXT;  -- 'twil
 | `WA_MAX_INSTANCES` | `50` | Set from Phase 9 measurement, not this default |
 | `WA_QR_TTL_SEC` | `60` | |
 | `WA_QR_MAX_ROUNDS` | `5` | |
+| `WA_CONNECT_TIMEOUT_MS` | `45000` | Watchdog for a socket that produces no event at all — see §21.4. Added in Phase 3 |
+| `WA_CONNECTOR` | `baileys` | `null` runs the service with pairing inert. This is what rollout step 5 in §16.2 needs |
 | `WA_RECONNECT_BASE_MS` | `2000` | |
 | `WA_RECONNECT_MAX_MS` | `300000` | |
 | `WA_RECONNECT_MAX_ATTEMPTS` | `10` | |

@@ -68,6 +68,17 @@ export const configSchema = z.object({
 
   REDIS_URL: z.string().default('redis://redis:6379'),
 
+  /**
+   * Which connector backs the WhatsAppConnector port.
+   *
+   * `baileys` is production. `null` runs the whole service — auth, tenancy,
+   * manifest, events — with pairing inert, which is what the rollout in §16.2
+   * needs at step 5: the backend and frontend deploy with the feature flag off,
+   * and this lets the gateway stand up alongside them without a single socket
+   * reaching WhatsApp until somebody decides it should.
+   */
+  WA_CONNECTOR: z.enum(['baileys', 'null']).default('baileys'),
+
   WA_SESSION_DIR: z.string().default('/data/sessions'),
   WA_MANIFEST_PATH: z.string().default('/data/instances.json'),
   WA_QUARANTINE_DIR: z.string().default('/data/quarantine'),
@@ -78,6 +89,23 @@ export const configSchema = z.object({
 
   WA_QR_TTL_SEC: intFromEnv(60, 10, 300),
   WA_QR_MAX_ROUNDS: intFromEnv(5, 1, 20),
+
+  /**
+   * How long a new socket may produce NO signal at all before we give up.
+   *
+   * Not a duplicate of Baileys' own `connectTimeoutMs`. Found by running this
+   * against a network that blocks WhatsApp: the WebSocket was refused in under
+   * 100ms, and Baileys emitted no `connection.update` whatsoever — no QR, no
+   * close, no error. Five minutes later the instance was still `connecting`.
+   *
+   * In production that is a studio watching a spinner forever the first time
+   * the VPS loses egress to WhatsApp, or WhatsApp blocks the IP. Baileys'
+   * timeout did not rescue it, so this watchdog exists instead of trusting it.
+   *
+   * Longer than Baileys' 20s default so its own handling gets first refusal;
+   * short enough that the UI reaches a real state while somebody is watching.
+   */
+  WA_CONNECT_TIMEOUT_MS: intFromEnv(45_000, 5_000, 300_000),
 
   WA_RECONNECT_BASE_MS: intFromEnv(2_000, 100, 60_000),
   WA_RECONNECT_MAX_MS: intFromEnv(300_000, 1_000, 3_600_000),

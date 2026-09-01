@@ -17,22 +17,32 @@ third-party provider account.
 
 ## Status
 
-**Phase 2 — the service runs, authenticates and isolates tenants. It cannot
-talk to WhatsApp yet.**
+**Phase 3 — Baileys is wired in and pairing is implemented. It has not yet been
+scanned by a real phone.**
 
 | Phase | State |
 |---|---|
 | 0 — Audit of `619-erp-frontend` / `619-erp-backend` | ✅ Done |
 | 1 — Architecture, API contract, security design | ✅ Done |
-| 2 — Service skeleton | ✅ This commit |
-| 3 — Baileys QR pairing | ⬜ Next |
-| 4–5 — Persistent session, connection lifecycle | ⬜ |
+| 2 — Service skeleton | ✅ Done |
+| 3 — Baileys QR pairing | ✅ This commit |
+| 4 — Session hardening (quarantine, corruption recovery) | ⬜ Next |
+| 5 — Reconnection backoff | ⬜ |
 | 6–8 — Webhook delivery, ERP integration, UI | ⬜ |
 | 9–13 — Tests, real QR test, Docker, VPS, production | ⬜ |
 
-Pairing is deliberately inert until Phase 3: `src/domain/nullConnector.ts`
-stands in for Baileys behind the `WhatsAppConnector` port and never reports
-`connected`, so nothing downstream can mistake a stub for a working pairing.
+### What "not yet scanned" means
+
+The build environment's egress proxy blocks `web.whatsapp.com` with a 403, so
+**no QR has been produced from WhatsApp's servers here.** Everything up to that
+boundary is verified — the socket opens, the version negotiates, auth state
+round-trips, the watchdog fires, tenant isolation holds — but a real pairing is
+Phase 10, on a host with egress, and **passing tests are not evidence that a
+phone can scan this.** See §21.4 of the architecture.
+
+`WA_CONNECTOR=null` runs the whole service with pairing inert, which is what
+rollout step 5 needs: the gateway can stand up alongside a backend whose
+feature flag is still off, with no socket reaching WhatsApp.
 
 ## Development
 

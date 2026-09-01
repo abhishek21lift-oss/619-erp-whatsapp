@@ -10,6 +10,8 @@ import { Manifest } from './store/manifest.js';
 import { Outbox } from './events/outbox.js';
 import { InstanceRegistry } from './domain/registry.js';
 import { NullConnector } from './domain/nullConnector.js';
+import { BaileysConnector } from './domain/baileysConnector.js';
+import type { WhatsAppConnector } from './domain/instance.js';
 import { ensureDir } from './store/paths.js';
 
 const require = createRequire(import.meta.url);
@@ -53,9 +55,23 @@ async function main(): Promise<void> {
   const outbox = new Outbox(redis.client);
   const qr = new QrStore(redis.client, config.WA_QR_TTL_SEC);
 
-  // Phase 3 swaps NullConnector for the Baileys implementation. Nothing else on
-  // this page changes when it does — that is what the port is for.
-  const connector = new NullConnector();
+  // The manifest is the single source of instance ownership, so the connector
+  // asks it rather than keeping a second copy that could drift from the
+  // registry's. It is passed as a function, not the manifest itself, so the
+  // connector cannot mutate it.
+  const connector: WhatsAppConnector =
+    config.WA_CONNECTOR === 'baileys'
+      ? new BaileysConnector({
+          sessionRoot: config.WA_SESSION_DIR,
+          qr,
+          outbox,
+          resolveTenant: (instanceId) => manifest.get(instanceId)?.organization_id,
+          qrTtlSec: config.WA_QR_TTL_SEC,
+          qrMaxRounds: config.WA_QR_MAX_ROUNDS,
+          connectTimeoutMs: config.WA_CONNECT_TIMEOUT_MS,
+        })
+      : new NullConnector();
+  log.info({ connector: config.WA_CONNECTOR }, 'connector_selected');
 
   const registry = new InstanceRegistry({
     manifest,
