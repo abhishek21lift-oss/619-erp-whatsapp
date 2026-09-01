@@ -69,8 +69,31 @@ jobs:
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml build whatsapp
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml up -d whatsapp
 
-            # Verify liveness, health and that no host port was published.
-            docker inspect --format '{{.State.Health.Status}}' myptstudio-whatsapp
+            # The container may still be in Docker's healthcheck start period.
+            # Wait up to 60s for it to become healthy instead of treating the
+            # initial `starting` state as a deployment failure.
+            echo "Waiting for myptstudio-whatsapp to become healthy..."
+            for i in $(seq 1 60); do
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' myptstudio-whatsapp 2>/dev/null || true)"
+              echo "health[$i/60]: $status"
+              if [ "$status" = "healthy" ]; then
+                break
+              fi
+              if [ "$status" = "unhealthy" ] || [ "$status" = "no-healthcheck" ]; then
+                echo "Gateway failed health validation"
+                docker logs --tail 100 myptstudio-whatsapp || true
+                exit 1
+              fi
+              sleep 1
+            done
+
+            final_status="$(docker inspect --format '{{.State.Health.Status}}' myptstudio-whatsapp)"
+            [ "$final_status" = "healthy" ] || {
+              echo "Gateway did not become healthy within 60s"
+              docker logs --tail 100 myptstudio-whatsapp || true
+              exit 1
+            }
+
             docker inspect --format '{{json .NetworkSettings.Ports}}' myptstudio-whatsapp
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml ps whatsapp
             docker exec myptstudio-whatsapp node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1);return r.json()}).then(console.log)"
