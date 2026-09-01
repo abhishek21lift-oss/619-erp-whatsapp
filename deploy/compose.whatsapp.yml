@@ -35,8 +35,7 @@
 # the compose network. Docker's embedded DNS would also resolve the
 # `container_name` on its own, but that was not testable in the build
 # environment (no image could be pulled to try it), so the alias makes the name
-# a stated fact about this file rather than an assumption about Docker. The
-# service name is only what you type.
+# a stated fact about this file rather than an assumption about Docker.
 #
 # ⚠️ The alias assumes the box's services sit on compose's implicit `default`
 # network. If /opt/myptstudio/docker-compose.yml declares a named network,
@@ -152,9 +151,13 @@ services:
           # The hostname the backend's WA_GATEWAY_URL resolves. See the header.
           - myptstudio-whatsapp
 
+    # The existing production Redis container has no Docker healthcheck.
+    # `service_healthy` therefore blocks startup even when Redis is running.
+    # `service_started` preserves dependency ordering without modifying the
+    # existing production Redis service.
     depends_on:
       redis:
-        condition: service_healthy
+        condition: service_started
 
     # The image's HEALTHCHECK probes /healthz (liveness only — it touches
     # nothing external on purpose, so a Redis blip cannot restart-loop a healthy
