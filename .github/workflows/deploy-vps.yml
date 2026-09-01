@@ -40,9 +40,6 @@ jobs:
             docker compose config --services | grep -qx 'redis'
             docker compose config --services | grep -qx 'backend'
 
-            # Resolve the exact production network shared by Redis and backend.
-            # Do not use the first backend network because backend also belongs
-            # to the separate ai-gateway network.
             WA_NETWORK_NAME="$(docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' myptstudio-redis | head -n 1)"
             [ -n "$WA_NETWORK_NAME" ]
             if ! docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' myptstudio-backend | grep -Fxq "$WA_NETWORK_NAME"; then
@@ -70,6 +67,12 @@ jobs:
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml config >/dev/null
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml build whatsapp
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml up -d whatsapp
+
+            # Compose merges the base service network map, so explicitly enforce
+            # the existing ERP network on the created container before health checks.
+            docker network connect "$WA_NETWORK_NAME" myptstudio-whatsapp 2>/dev/null || true
+            docker network disconnect ai-gateway myptstudio-whatsapp 2>/dev/null || true
+            docker restart myptstudio-whatsapp
 
             echo "Waiting for myptstudio-whatsapp to become healthy..."
             for i in $(seq 1 60); do
