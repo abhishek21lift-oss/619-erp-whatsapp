@@ -17,8 +17,8 @@ third-party provider account.
 
 ## Status
 
-**Phase 5 — pairing, session persistence and the reconnection lifecycle are
-implemented. It has not yet been scanned by a real phone.**
+**Phase 6 — pairing, session persistence, the reconnection lifecycle and signed
+event delivery are implemented. It has not yet been scanned by a real phone.**
 
 | Phase | State |
 |---|---|
@@ -27,8 +27,9 @@ implemented. It has not yet been scanned by a real phone.**
 | 2 — Service skeleton | ✅ Done |
 | 3 — Baileys QR pairing | ✅ Done |
 | 4 — Session persistence hardening | ✅ Done |
-| 5 — Connection lifecycle / reconnect backoff | ✅ This commit |
-| 6–8 — Webhook delivery, ERP integration, UI | ⬜ Next |
+| 5 — Connection lifecycle / reconnect backoff | ✅ Done |
+| 6 — Signed webhook delivery to the backend | ✅ This commit |
+| 7–8 — ERP backend integration, UI | ⬜ Next |
 | 9–13 — Tests, real QR test, Docker, VPS, production | ⬜ |
 
 ### What "not yet scanned" means
@@ -49,7 +50,7 @@ feature flag is still off, with no socket reaching WhatsApp.
 ```bash
 npm install
 npm run dev        # tsx watch, reads .env
-npm test           # 115 tests, no Redis or WhatsApp needed
+npm test           # 144 tests, no Redis or WhatsApp needed
 npm run typecheck
 npm run lint
 npm run build      # → dist/

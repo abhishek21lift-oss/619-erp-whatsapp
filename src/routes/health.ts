@@ -19,7 +19,12 @@ export const PUBLIC_PATHS = ['/healthz', '/readyz'] as const;
 
 /** Only the part of the outbox /metrics needs — see store/qr.ts on fakeability. */
 export interface OutboxDepthReader {
-  depth(): Promise<{ pending: number; processing: number; dead: number }>;
+  depth(): Promise<{
+    pending: number;
+    processing: number;
+    retrying: number;
+    dead: number;
+  }>;
 }
 
 export interface HealthDeps {
@@ -79,6 +84,12 @@ export function registerHealthRoutes(app: FastifyInstance, deps: HealthDeps): vo
       instances_capacity: summary.capacity,
       outbox_pending: depth.pending,
       outbox_processing: depth.processing,
+      // Events waiting out a backoff after a failed delivery. Invisible until
+      // Phase 6 added it, which would have made a growing retry backlog —
+      // the leading indicator of a dead-letter — impossible to see.
+      outbox_retrying: depth.retrying,
+      // One of the two counters §14.4 says should page: a dead-lettered event
+      // is a state change the ERP never received.
       outbox_dead: depth.dead,
     };
   });

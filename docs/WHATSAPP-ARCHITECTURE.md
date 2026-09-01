@@ -599,6 +599,41 @@ exponential backoff with jitter (2s → ~64s), then the dead-letter list. §11.2
 **Non-2xx is a retry; 2xx is done.** The backend returns 200 for a duplicate,
 because a duplicate *is* success from the sender's point of view.
 
+**A 4xx is retried too, and that is deliberate.** The one 4xx the backend is
+expected to produce is `401` on a signature mismatch, which in practice means
+`WA_WEBHOOK_SECRET` has drifted between the two containers — a deploy error that
+*will* be fixed, and the event should still be waiting when it is. Dropping on
+4xx would silently lose every state change for as long as the mismatch lasted.
+
+*(Implemented in Phase 6: `src/events/deliverer.ts`.)*
+
+### 8.5 The retry queue is a ZSET, not a list *(Phase 6)*
+
+Delayed retries live in `wa:outbox:retry`, scored by when they are due, rather
+than in a list. A list has no notion of "not yet", and the obvious alternative —
+sleeping in the delivery loop before retrying — would block every *other* event
+behind one failing one, so a single unreachable backend would stall the whole
+outbox instead of just its own event.
+
+The attempt counter is stored **in the envelope in Redis**, not in memory. A
+gateway restart therefore continues an event's budget rather than handing it a
+fresh one; verified live by killing the gateway mid-retry and watching an event
+resume at attempt 5 and then dead-letter at 6.
+
+### 8.6 Why the loop polls instead of using BRPOPLPUSH *(Phase 6)*
+
+§11.2 names BRPOPLPUSH, and it is the textbook choice. But a blocking command
+occupies its Redis connection for the whole block, so ioredis queues every other
+command behind it — the QR writes, the instance locks, the depth reads. Avoiding
+that needs a second dedicated connection, which is the complexity the ERP's
+`lib/redis.js` carries for its BullMQ workers.
+
+It does not earn its keep here. The loop drains at full speed while there is
+work and only sleeps once the queue is empty, so the poll interval is the
+latency on an **idle** queue — and on an idle queue nobody is waiting. One
+connection, no blocking command that can wedge the rest of the service, and a
+loop that can be stepped one tick at a time in a test.
+
 ---
 
 ## 9. Message lifecycle

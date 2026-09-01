@@ -146,8 +146,8 @@ export class FakeOutbox implements EventSink {
     return this.events.filter((e) => e.instance_id === instanceId).map((e) => e.event_type);
   }
 
-  depth(): Promise<{ pending: number; processing: number; dead: number }> {
-    return Promise.resolve({ pending: this.events.length, processing: 0, dead: 0 });
+  depth(): Promise<{ pending: number; processing: number; retrying: number; dead: number }> {
+    return Promise.resolve({ pending: this.events.length, processing: 0, retrying: 0, dead: 0 });
   }
 }
 

@@ -8,6 +8,7 @@ import { createRedis } from './store/redis.js';
 import { QrStore } from './store/qr.js';
 import { Manifest } from './store/manifest.js';
 import { Outbox } from './events/outbox.js';
+import { DeliveryWorker } from './events/deliverer.js';
 import { InstanceRegistry } from './domain/registry.js';
 import { NullConnector } from './domain/nullConnector.js';
 import { BaileysConnector } from './domain/baileysConnector.js';
@@ -131,6 +132,16 @@ async function main(): Promise<void> {
   }, QUARANTINE_SWEEP_INTERVAL_MS);
   quarantineSweeper.unref();
 
+  // Drains the outbox to the backend's webhook. Started AFTER the restore
+  // sweep so the events that sweep produces are delivered by a worker that is
+  // already running, rather than queuing behind a boot that is still going.
+  const deliverer = new DeliveryWorker({
+    outbox,
+    backendUrl: config.WA_BACKEND_URL,
+    webhookSecret: config.WA_WEBHOOK_SECRET,
+  });
+  deliverer.start();
+
   const app = await buildApp({
     config,
     registry,
@@ -161,10 +172,12 @@ async function main(): Promise<void> {
     deadline.unref();
 
     try {
-      // Order matters: stop accepting requests, then release WhatsApp sockets,
-      // then drop Redis. Closing Redis first would strand the connector's
-      // final QR clears and lock releases.
+      // Order matters: stop accepting requests, drain the in-flight webhook,
+      // then release WhatsApp sockets, then drop Redis. Closing Redis first
+      // would strand the deliverer's acknowledgement and the connector's final
+      // QR clears and lock releases.
       await app.close();
+      await deliverer.stop();
       await connector.shutdown();
       await redis.close();
       clearTimeout(deadline);

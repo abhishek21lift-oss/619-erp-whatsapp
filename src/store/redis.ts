@@ -21,6 +21,15 @@ export const keys = {
   qr: (instanceId: string) => `${KEY_PREFIX}qr:${instanceId}`,
   outbox: `${KEY_PREFIX}outbox`,
   outboxProcessing: `${KEY_PREFIX}outbox:processing`,
+  /**
+   * Delayed retries, scored by when they are due.
+   *
+   * A ZSET rather than a list because a list has no notion of "not yet". The
+   * alternative — sleeping in the delivery loop before retrying — would block
+   * every OTHER event behind one failing one, so a single unreachable backend
+   * would stall the whole outbox instead of just its own event.
+   */
+  outboxRetry: `${KEY_PREFIX}outbox:retry`,
   outboxDead: `${KEY_PREFIX}outbox:dead`,
   rateLimit: (instanceId: string) => `${KEY_PREFIX}ratelimit:${instanceId}`,
   lock: (instanceId: string) => `${KEY_PREFIX}lock:${instanceId}`,

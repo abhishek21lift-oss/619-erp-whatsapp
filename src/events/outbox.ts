@@ -32,10 +32,17 @@ import { operationLogger } from '../logger.js';
  */
 export const PROCESSING_RECLAIM_MS = 60_000;
 
-interface Envelope {
+export interface Envelope {
   event: GatewayEvent;
   enqueued_at: number;
   attempts: number;
+}
+
+/** One claimed item: the exact string in Redis, plus its parsed form. */
+export interface ClaimedEvent {
+  /** The verbatim member — LREM matches by value, so it must not be re-encoded. */
+  raw: string;
+  envelope: Envelope;
 }
 
 /**
@@ -98,13 +105,100 @@ export class Outbox implements EventSink {
     return event;
   }
 
-  async depth(): Promise<{ pending: number; processing: number; dead: number }> {
-    const [pending, processing, dead] = await Promise.all([
+  async depth(): Promise<{
+    pending: number;
+    processing: number;
+    retrying: number;
+    dead: number;
+  }> {
+    const [pending, processing, retrying, dead] = await Promise.all([
       this.#redis.llen(keys.outbox),
       this.#redis.llen(keys.outboxProcessing),
+      this.#redis.zcard(keys.outboxRetry),
       this.#redis.llen(keys.outboxDead),
     ]);
-    return { pending, processing, dead };
+    return { pending, processing, retrying, dead };
+  }
+
+  /**
+   * Move any retries that have come due back onto the ready queue.
+   *
+   * ZREM before LPUSH, and only push when ZREM actually removed something.
+   * Two delivery loops (or a loop racing its own next tick) would otherwise
+   * both see the same due member and enqueue it twice — the ZREM result is the
+   * atomic claim.
+   */
+  async promoteDueRetries(now = Date.now(), limit = 100): Promise<number> {
+    const due = await this.#redis.zrangebyscore(
+      keys.outboxRetry,
+      '-inf',
+      now,
+      'LIMIT',
+      0,
+      limit,
+    );
+    let promoted = 0;
+    for (const raw of due) {
+      const claimed = await this.#redis.zrem(keys.outboxRetry, raw);
+      if (claimed === 1) {
+        await this.#redis.lpush(keys.outbox, raw);
+        promoted += 1;
+      }
+    }
+    return promoted;
+  }
+
+  /**
+   * Claim the next ready event, moving it to the processing list.
+   *
+   * RPOPLPUSH is atomic: the event is never in neither list, so a crash at any
+   * instant leaves it recoverable by `reclaimStale`. Non-blocking on purpose —
+   * see DeliveryWorker for why this service polls rather than using BRPOPLPUSH.
+   */
+  async claimNext(): Promise<ClaimedEvent | undefined> {
+    const raw = await this.#redis.rpoplpush(keys.outbox, keys.outboxProcessing);
+    if (raw === null) return undefined;
+
+    try {
+      return { raw, envelope: JSON.parse(raw) as Envelope };
+    } catch {
+      // Unparseable: it can never be delivered, and leaving it in processing
+      // means sweeping it forever. Dead-letter it where it is visible.
+      await this.#redis.lrem(keys.outboxProcessing, 1, raw);
+      await this.#redis.lpush(keys.outboxDead, raw);
+      return undefined;
+    }
+  }
+
+  /** Delivery succeeded — drop it from the processing list. */
+  async ack(claimed: ClaimedEvent): Promise<void> {
+    await this.#redis.lrem(keys.outboxProcessing, 1, claimed.raw);
+  }
+
+  /**
+   * Delivery failed but is worth another go: schedule it for `dueAt`.
+   *
+   * The attempt counter is incremented in the stored envelope, so it survives a
+   * gateway restart. Counting in memory instead would reset the budget on every
+   * deploy and let a permanently-failing event retry forever.
+   */
+  async scheduleRetry(claimed: ClaimedEvent, dueAt: number): Promise<void> {
+    const next: Envelope = { ...claimed.envelope, attempts: claimed.envelope.attempts + 1 };
+    await this.#redis.lrem(keys.outboxProcessing, 1, claimed.raw);
+    await this.#redis.zadd(keys.outboxRetry, dueAt, JSON.stringify(next));
+  }
+
+  /**
+   * Out of attempts. Preserved rather than dropped.
+   *
+   * A dead-lettered event is a message the ERP never received, so its row is
+   * now wrong and somebody has to know. `wa_outbox_dead` is one of the two
+   * metrics §14.4 says should page.
+   */
+  async deadLetter(claimed: ClaimedEvent): Promise<void> {
+    const final: Envelope = { ...claimed.envelope, attempts: claimed.envelope.attempts + 1 };
+    await this.#redis.lrem(keys.outboxProcessing, 1, claimed.raw);
+    await this.#redis.lpush(keys.outboxDead, JSON.stringify(final));
   }
 
   /**
