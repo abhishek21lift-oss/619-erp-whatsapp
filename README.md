@@ -17,16 +17,37 @@ third-party provider account.
 
 ## Status
 
-**Phase 1 — design complete. No service code yet.**
+**Phase 2 — the service runs, authenticates and isolates tenants. It cannot
+talk to WhatsApp yet.**
 
 | Phase | State |
 |---|---|
 | 0 — Audit of `619-erp-frontend` / `619-erp-backend` | ✅ Done |
-| 1 — Architecture, API contract, security design | ✅ This commit |
-| 2 — Service skeleton | ⬜ Not started |
-| 3–5 — Baileys pairing, session persistence, lifecycle | ⬜ |
-| 6–8 — Backend ↔ gateway auth, ERP integration, UI | ⬜ |
+| 1 — Architecture, API contract, security design | ✅ Done |
+| 2 — Service skeleton | ✅ This commit |
+| 3 — Baileys QR pairing | ⬜ Next |
+| 4–5 — Persistent session, connection lifecycle | ⬜ |
+| 6–8 — Webhook delivery, ERP integration, UI | ⬜ |
 | 9–13 — Tests, real QR test, Docker, VPS, production | ⬜ |
+
+Pairing is deliberately inert until Phase 3: `src/domain/nullConnector.ts`
+stands in for Baileys behind the `WhatsAppConnector` port and never reports
+`connected`, so nothing downstream can mistake a stub for a working pairing.
+
+## Development
+
+```bash
+npm install
+npm run dev        # tsx watch, reads .env
+npm test           # 49 tests, no Redis or WhatsApp needed
+npm run typecheck
+npm run lint
+npm run build      # → dist/
+```
+
+The tests use fakes for Redis and the connector but a **real temp filesystem**
+for the manifest, so atomic writes and restore-after-restart are exercised on
+every run rather than only where they are named.
 
 ## Read this first
 

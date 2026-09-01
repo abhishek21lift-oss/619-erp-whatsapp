@@ -1,0 +1,42 @@
+{
+  // NodeNext, not Bundler. There is no bundler here — Node runs dist/ directly —
+  // and NodeNext is the only resolution mode that models Node's real ESM/CJS
+  // interop. It is why every relative import below carries a `.js` extension
+  // even though the source is `.ts`: that is what Node will actually resolve at
+  // runtime, and TypeScript deliberately does not rewrite it.
+  //
+  // The cost is one habit; the benefit is that a dependency shipping CJS (which
+  // several of ours do — fastify, pino and ioredis are all `commonjs`) is
+  // imported correctly rather than through a shim that works in tests and
+  // fails in the container.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "outDir": "dist",
+    "rootDir": "src",
+    "sourceMap": true,
+    "declaration": false,
+
+    "strict": true,
+    // Beyond `strict`. Each of these has caught a real class of bug in services
+    // shaped like this one:
+    "noUncheckedIndexedAccess": true,      // map/array lookups are T | undefined
+    "exactOptionalPropertyTypes": true,    // `{ x?: string }` ≠ `{ x: undefined }`
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,    // the disconnect-reason switch (§5.1)
+    "noPropertyAccessFromIndexSignature": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"],
+  // Tests and their fakes never ship in the image. They are still typechecked
+  // — `npm run typecheck` uses tsconfig.check.json, which includes them.
+  "exclude": ["node_modules", "dist", "src/__tests__/**"]
+}

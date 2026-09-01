@@ -1,0 +1,15 @@
+{
+  // Typechecking covers the tests too; the build (tsconfig.json) does not, so
+  // test code is never emitted into the production image. A test that does not
+  // typecheck is a test that is quietly asserting the wrong thing.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // rootDir is only meaningful for emit, and this config emits nothing. It is
+    // cleared so the root-level config files below can be included without
+    // tsc objecting that they sit outside src/.
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "vitest.config.ts", "eslint.config.js"],
+  "exclude": ["node_modules", "dist"]
+}
