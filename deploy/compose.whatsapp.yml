@@ -1,215 +1,61 @@
-# The `whatsapp` service, for /opt/myptstudio/docker-compose.yml on the VPS.
-#
-# ── This file does not run anything by itself ───────────────────────────────
-#
-# The compose file that actually serves production lives on the box at
-# /opt/myptstudio/docker-compose.yml, outside every repository, and
-# 619-erp-backend's deploy.yml runs `docker compose build backend` /
-# `up -d backend` against it. Committing this here changes nothing on the box —
-# by design; the brief's rule is "do NOT modify production deployment
-# automatically".
-#
-# Two ways to use it, and the first is the one to take:
-#
-#   1. PASTE the `whatsapp:` block below into the `services:` map of
-#      /opt/myptstudio/docker-compose.yml, and the `whatsapp-sessions` entry into
-#      its `volumes:` map. Then `docker compose up -d whatsapp` behaves like every
-#      other service on the box, including under deploy.yml and rollback.yml.
-#
-#   2. Overlay it: `docker compose -f docker-compose.yml -f compose.whatsapp.yml`.
-#      Valid, but the deploy and rollback workflows invoke a bare
-#      `docker compose`, so the overlay is invisible to them unless COMPOSE_FILE
-#      is exported for every shell and every CI-driven SSH session. One missed
-#      shell and the gateway silently stops being part of the deployment.
-#
-# ── Names this file assumes, and how to check them ─────────────────────────
-#
-# Service `whatsapp`, container `myptstudio-whatsapp` — matching architecture
-# §15.3 and the convention the box already uses (service `backend`, container
-# `myptstudio-backend`). The container name is what has to be right: it is the
-# hostname 619-erp-backend/.env.example already documents,
-#
-#     WA_GATEWAY_URL=http://myptstudio-whatsapp:8080
-#
-# and the `networks.default.aliases` entry below publishes exactly that name on
-# the compose network. Docker's embedded DNS would also resolve the
-# `container_name` on its own, but that was not testable in the build
-# environment (no image could be pulled to try it), so the alias makes the name
-# a stated fact about this file rather than an assumption about Docker.
-#
-# ⚠️ The alias assumes the box's services sit on compose's implicit `default`
-# network. If /opt/myptstudio/docker-compose.yml declares a named network,
-# change `default:` below to match it — otherwise this container lands on a
-# different network and cannot reach `redis` or the backend at all.
-#
-# Before pasting, confirm the neighbours on the box:
-#
-#     docker compose -f /opt/myptstudio/docker-compose.yml config --services
-#
-# If the Redis service there is not called `redis`, fix REDIS_URL below to match
-# it rather than renaming anything that already works.
+# WhatsApp gateway overlay for the production MY PT STUDIO Compose stack.
+# The gateway must share the existing ERP Docker network with backend and Redis.
 
 services:
   whatsapp:
     container_name: myptstudio-whatsapp
-    # The gateway is its own repository. Clone it beside the other two:
-    #   git clone git@github.com:abhishek21lift-oss/619-erp-whatsapp.git \
-    #     /opt/myptstudio/619-erp-whatsapp
     build:
       context: ./619-erp-whatsapp
     restart: unless-stopped
 
-    # ── NO `ports:` — deliberately, and this is the primary security control ──
-    #
-    # The gateway holds Baileys auth state for every connected studio: full
-    # WhatsApp account access. Its only caller is the backend container, over
-    # this Docker network. Publishing a host port — even on 127.0.0.1 — would
-    # put that behind nothing but the shared X-Gateway-Key, and would make it
-    # reachable by anything else on the box.
-    #
-    # There is no nginx vhost for it either. If you ever need to reach it from
-    # the host for debugging, use `docker compose exec`, not a published port.
-
     environment:
       NODE_ENV: production
       PORT: '8080'
-      # 0.0.0.0 inside a container with no published port is not an exposure:
-      # the Docker network is the only route in.
       HOST: 0.0.0.0
-      # Never `debug` here. It turns on Baileys protocol logging, which is a far
-      # wider surface than the redaction deny-list in src/logger.ts can promise
-      # to cover — and what it would leak is session material.
       LOG_LEVEL: ${WA_LOG_LEVEL:-info}
-
-      # `:?` and not the bare `${VAR}` used elsewhere on this box. Verified,
-      # because the difference matters here: a bare `${VAR}` that is unset does
-      # NOT stop compose — it prints
-      #
-      #     level=warning msg="The \"WA_GATEWAY_KEY\" variable is not set.
-      #                        Defaulting to a blank string."
-      #
-      # and carries on. `:?` makes `docker compose up` exit non-zero instead.
-      #
-      # The gateway's own src/config.ts already refuses to start on a blank or
-      # short secret, so this is the outer of two layers rather than the only
-      # one — but the outer layer fails at deploy time with the operator
-      # watching, and the inner one fails afterwards in a restart loop.
-      #
-      # Both values must MATCH the ones set on the backend service.
-      WA_GATEWAY_KEY: ${WA_GATEWAY_KEY:?set it in /opt/myptstudio/.env — openssl rand -hex 32, and it must match the backend}
-      WA_WEBHOOK_SECRET: ${WA_WEBHOOK_SECRET:?set it in /opt/myptstudio/.env — openssl rand -hex 32, and it must match the backend}
-
-      # The single host this service ever calls outbound. Fixed configuration,
-      # never caller-supplied — see the gateway's src/events/deliverer.ts.
+      WA_GATEWAY_KEY: ${WA_GATEWAY_KEY:?set it in /opt/myptstudio/.env}
+      WA_WEBHOOK_SECRET: ${WA_WEBHOOK_SECRET:?set it in /opt/myptstudio/.env}
       WA_BACKEND_URL: ${WA_BACKEND_URL:-http://myptstudio-backend:5000}
-
-      # A HARD dependency here, unlike in the ERP: QR storage, the event outbox
-      # and the single-owner instance lock all need it. The gateway namespaces
-      # every key under `wa:`, so it shares this Redis with BullMQ's `bull:`
-      # keys without collision — but see docs/DEPLOYMENT.md §10 on the
-      # `noeviction` maxmemory budget they share.
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-
       WA_SESSION_DIR: /data/sessions
       WA_MANIFEST_PATH: /data/instances.json
       WA_QUARANTINE_DIR: /data/quarantine
-
-      # UNTESTED DEFAULT. docs/TESTING.md §6 measured per-instance memory only
-      # for instances that never connected, because the build environment
-      # cannot reach WhatsApp — that figure is a floor, not an operating
-      # number. Re-measure against connected sessions (Phase 10) before raising
-      # this or trusting it.
       WA_MAX_INSTANCES: ${WA_MAX_INSTANCES:-50}
-
       WA_QR_TTL_SEC: ${WA_QR_TTL_SEC:-60}
       WA_QR_MAX_ROUNDS: ${WA_QR_MAX_ROUNDS:-5}
       WA_CONNECT_TIMEOUT_MS: ${WA_CONNECT_TIMEOUT_MS:-45000}
-
-      # `baileys` in production. `null` runs the whole service — auth, tenancy,
-      # manifest, events — with pairing inert, which is how you stand the
-      # gateway up beside a backend that has no WA_GATEWAY_URL set yet.
       WA_CONNECTOR: ${WA_CONNECTOR:-baileys}
 
     volumes:
-      # ── The one piece of state that cannot be rebuilt ────────────────────
-      #
-      # Every linked studio's Baileys credentials live here. Lose this volume
-      # and every studio has to re-scan a QR; there is no other copy, and the
-      # backend's whatsapp_instances row records that a studio IS linked, so
-      # the mismatch is visible to them before it is visible to you.
-      #
-      # A NAMED volume, not a bind mount: the image creates /data owned by uid
-      # 1001 at build time and Docker copies that ownership onto a named volume
-      # on first attach. A host bind mount arrives root-owned instead, and the
-      # non-root process then fails its first `saveCreds` — much later, during
-      # somebody's first pairing.
       - whatsapp-sessions:/data
 
+    # Attach explicitly to the same external Docker network as the existing
+    # backend/Redis services. WA_NETWORK_NAME is resolved by the deployment
+    # workflow from the already-running backend container, so we never guess
+    # or rename the production network.
     networks:
-      default:
+      myptstudio_network:
         aliases:
-          # The hostname the backend's WA_GATEWAY_URL resolves. See the header.
           - myptstudio-whatsapp
 
-    # The existing production Redis container has no Docker healthcheck.
-    # `service_healthy` therefore blocks startup even when Redis is running.
-    # `service_started` preserves dependency ordering without modifying the
-    # existing production Redis service.
     depends_on:
       redis:
         condition: service_started
 
-    # The image's HEALTHCHECK probes /healthz (liveness only — it touches
-    # nothing external on purpose, so a Redis blip cannot restart-loop a healthy
-    # process and drop every live WhatsApp socket). /readyz is the one that
-    # reports dependencies, and it is for an operator, not for Docker.
-
-    # 30s, matching the worker service. src/server.ts budgets 25s for its
-    # ordered teardown, and being SIGKILLed partway through means WhatsApp
-    # sockets vanish mid-session rather than closing — one of the traffic
-    # patterns that looks like abuse from Meta's side. That is a risk to a
-    # studio's phone number, not just to this container.
     stop_grace_period: 30s
 
-    # Log rotation, which the other services on this box do not set.
-    #
-    # Not a stylistic divergence: this service reconnects on a backoff loop
-    # whenever WhatsApp is unreachable, so an outage that lasts a weekend
-    # writes steadily to the container log. Docker's json-file driver is
-    # unbounded by default, and the failure mode is the host disk filling —
-    # which takes the API and Postgres client connections down with it.
     logging:
       driver: json-file
       options:
         max-size: '10m'
         max-file: '5'
 
-    # A memory ceiling, accepting that hitting it kills the container.
-    #
-    # The trade is deliberate. If the gateway is OOM-killed it restarts and
-    # restores every session from /data WITHOUT a new QR (docs/TESTING.md §4.3
-    # is the check that proves this) — recoverable, and only WhatsApp is
-    # affected. If instead an unbounded gateway exhausts the box, the kernel
-    # picks the victim, and on a VPS this size that is as likely to be the API
-    # as the gateway.
-    #
-    # 1G, per architecture §15.3, and NOT the ~512m that 2.5x the largest
-    # measured RSS would suggest. That measurement (182 MB at 10 instances,
-    # docs/TESTING.md §6) was taken on a host that cannot reach WhatsApp, so
-    # every one of those instances was UNCONNECTED — it is a floor, and sizing
-    # a kill threshold from a floor is how you discover the real figure by
-    # OOM-killing a studio mid-pairing. 1G leaves room for the Signal session
-    # state, app-state sync keys and LID mapping store that a live session
-    # holds and this measurement never saw.
-    #
-    # `mem_limit`, not `deploy.resources.limits.memory` as §15.3 sketched:
-    # both work under Compose v2, but the `deploy:` key is silently ignored by
-    # anything reading this file as a Swarm-less v1-style config, and a memory
-    # limit that is silently absent is worse than none.
-    #
-    # A guard against runaway, NOT a validated capacity figure. The Phase 10
-    # measurement that settles WA_MAX_INSTANCES settles this too.
     mem_limit: ${WA_MEM_LIMIT:-1g}
+
+networks:
+  myptstudio_network:
+    external: true
+    name: ${WA_NETWORK_NAME:?deployment must set WA_NETWORK_NAME to the existing ERP Docker network}
 
 volumes:
   whatsapp-sessions:
