@@ -837,11 +837,25 @@ that reads it.
 `whatsapp_instances` — [full DDL in Appendix C](#appendix-c-erp-schema-changes).
 Plus `whatsapp_webhook_events` for the idempotency ledger.
 
-Both carry `organization_id UUID REFERENCES organizations(id)`, so **RLS covers
-them automatically**: migrations 157/158 loop over
-`information_schema.columns` for `organization_id` and attach the
-`tenant_isolation` policy. Re-running that block is all that is required — no
-hand-written policy to drift out of sync.
+Both carry `organization_id UUID REFERENCES organizations(id)`, so re-running
+migrations 157/158's discovery block attaches the `tenant_isolation` policy to
+them along with every other tenant table — no hand-written policy to drift out
+of sync.
+
+> **Corrected in Phase 7.** This section said RLS was covered "automatically" by
+> that block alone. It is not sufficient: the repo enforces a stricter
+> convention from migration 104 onwards (`src/__tests__/rls.convention.test.js`)
+> requiring every created table to **name itself** in an explicit
+> `ALTER TABLE … ENABLE ROW LEVEL SECURITY`, a `deny_all_direct_access` policy,
+> and `REVOKE ALL … FROM anon, authenticated`. The first full backend test run
+> failed on exactly this.
+>
+> That check exists because of audit finding C-01 — fifteen tables shipped with
+> RLS off while `anon` held SELECT and INSERT, not one mistake but the same
+> omission repeated across months. `whatsapp_instances` would have been the
+> sixteenth: it exposes which studios have WhatsApp connected and their phone
+> numbers, reachable through PostgREST with the publishable key. Migration 185
+> now carries the full convention explicitly.
 
 Migration number **185**. (184 is the highest currently used; note 174/175/176
 already have duplicate numbering in the repo, so the next free number is not
@@ -1542,8 +1556,23 @@ one is "pause, no rescan needed", the other is "unlink, rescan required".
 | `DELETE` | `/api/integrations/whatsapp` | Full unlink |
 | `POST` | `/api/webhooks/whatsapp` | Gateway → backend. HMAC-verified, mounted **before** `express.json()` |
 
-⚠️ Adding these changes the frontend's `api-shape.test.ts` snapshot of all 462
-endpoints. It must be updated in the same commit, deliberately.
+**Implemented in Phase 7.** `619-erp-backend`:
+`src/routes/whatsapp.js`, `src/routes/whatsapp-webhook.js`,
+`src/lib/whatsappGateway.js`, `src/db/migrations/185_whatsapp_instances.sql`.
+
+Two ordering constraints in `server.js` that are load-bearing rather than
+stylistic:
+
+- **`/api/integrations/whatsapp` is mounted BEFORE the generic
+  `/api/integrations` router.** `integrations.js` owns `/:id/connect` over a
+  table of API keys, so without that ordering `/whatsapp/connect` matches with
+  `id='whatsapp'` — storing an api_key nothing reads and reporting success,
+  which is exactly what that handler does today for the cosmetic WhatsApp card
+  (Phase 0, finding F3).
+- **The webhook is mounted before `express.json()`**, like the Razorpay one.
+
+⚠️ The frontend endpoints (Phase 8) will change `api-shape.test.ts`'s snapshot of
+all 462 endpoints. It must be updated in the same commit, deliberately.
 
 ---
 

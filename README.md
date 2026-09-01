@@ -17,8 +17,8 @@ third-party provider account.
 
 ## Status
 
-**Phase 6 — pairing, session persistence, the reconnection lifecycle and signed
-event delivery are implemented. It has not yet been scanned by a real phone.**
+**Phase 7 — the gateway and the ERP backend are integrated end to end. It has
+not yet been scanned by a real phone.**
 
 | Phase | State |
 |---|---|
@@ -28,8 +28,9 @@ event delivery are implemented. It has not yet been scanned by a real phone.**
 | 3 — Baileys QR pairing | ✅ Done |
 | 4 — Session persistence hardening | ✅ Done |
 | 5 — Connection lifecycle / reconnect backoff | ✅ Done |
-| 6 — Signed webhook delivery to the backend | ✅ This commit |
-| 7–8 — ERP backend integration, UI | ⬜ Next |
+| 6 — Signed webhook delivery to the backend | ✅ Done |
+| 7 — ERP backend integration | ✅ Done (in `619-erp-backend`) |
+| 8 — Settings → Integrations UI | ⬜ Next |
 | 9–13 — Tests, real QR test, Docker, VPS, production | ⬜ |
 
 ### What "not yet scanned" means
