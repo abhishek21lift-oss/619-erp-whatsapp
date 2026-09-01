@@ -29,8 +29,10 @@ services:
     volumes:
       - whatsapp-sessions:/data
 
-    # Use the existing production ERP network. The deployment workflow resolves
-    # WA_NETWORK_NAME to the network already shared by Redis and backend.
+    # Explicitly place the gateway on the existing production ERP network.
+    # This overlay is intentionally independent of the base compose file's
+    # network declarations so the merged config cannot silently select another
+    # project/default network.
     networks:
       myptstudio_network:
         aliases:
