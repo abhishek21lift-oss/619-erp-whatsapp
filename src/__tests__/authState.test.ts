@@ -6,7 +6,7 @@
 // for a restart to avoid a QR rescan.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -14,13 +14,16 @@ import { useAtomicFileAuthState, safeFileName } from '../store/authState.js';
 import { GatewayError } from '../errors.js';
 
 let dir: string;
+let quarantineDir: string;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'wa-gw-auth-'));
+  const root = await mkdtemp(path.join(tmpdir(), 'wa-gw-auth-'));
+  dir = path.join(root, 'sessions', 'inst-a');
+  quarantineDir = path.join(root, 'quarantine');
 });
 
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+  await rm(path.dirname(path.dirname(dir)), { recursive: true, force: true });
 });
 
 describe('safeFileName', () => {
@@ -60,18 +63,18 @@ describe('safeFileName', () => {
 
 describe('useAtomicFileAuthState', () => {
   it('mints fresh credentials on a first run and reports restored: false', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
     expect(auth.restored).toBe(false);
     expect(auth.state.creds.registrationId).toBeTypeOf('number');
     expect(auth.state.creds.registered).toBe(false);
   });
 
   it('round-trips credentials across a reopen — the no-rescan property', async () => {
-    const first = await useAtomicFileAuthState(dir);
+    const first = await useAtomicFileAuthState(dir, quarantineDir);
     const registrationId = first.state.creds.registrationId;
     await first.saveCreds();
 
-    const second = await useAtomicFileAuthState(dir);
+    const second = await useAtomicFileAuthState(dir, quarantineDir);
     expect(second.restored).toBe(true);
     expect(second.state.creds.registrationId).toBe(registrationId);
   });
@@ -81,11 +84,11 @@ describe('useAtomicFileAuthState', () => {
     // `{"0":12,"1":88,…}` would restore a session that connects and then fails
     // every decryption — which is why BufferJSON is used rather than plain
     // JSON.stringify.
-    const first = await useAtomicFileAuthState(dir);
+    const first = await useAtomicFileAuthState(dir, quarantineDir);
     const original = Buffer.from(first.state.creds.noiseKey.private);
     await first.saveCreds();
 
-    const second = await useAtomicFileAuthState(dir);
+    const second = await useAtomicFileAuthState(dir, quarantineDir);
     const restored = second.state.creds.noiseKey.private;
 
     expect(Buffer.isBuffer(restored) || restored instanceof Uint8Array).toBe(true);
@@ -93,7 +96,7 @@ describe('useAtomicFileAuthState', () => {
   });
 
   it('stores and reads back signal keys', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
     const value = new Uint8Array([1, 2, 3, 4, 5]);
 
     await auth.state.keys.set({ session: { 'peer-1': value } });
@@ -103,7 +106,7 @@ describe('useAtomicFileAuthState', () => {
   });
 
   it('deletes a key when set to null, as Baileys expects', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
     await auth.state.keys.set({ session: { 'peer-1': new Uint8Array([9]) } });
     await auth.state.keys.set({ session: { 'peer-1': null } });
 
@@ -112,7 +115,7 @@ describe('useAtomicFileAuthState', () => {
   });
 
   it('leaves no temp files behind — a torn write is the unrecoverable failure', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
     await auth.saveCreds();
     await auth.state.keys.set({
       'pre-key': Object.fromEntries(
@@ -129,7 +132,7 @@ describe('useAtomicFileAuthState', () => {
   });
 
   it('does not interleave concurrent writes', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
 
     // Twenty concurrent saves. Without serialisation two writers can rename
     // over each other mid-flight and leave a file that is neither version.
@@ -139,19 +142,26 @@ describe('useAtomicFileAuthState', () => {
     expect(() => JSON.parse(raw)).not.toThrow();
   });
 
-  it('reports restored: false when creds.json exists but is corrupt', async () => {
-    // The distinction that matters for Phase 4: a MISSING file is a first
-    // pairing, a CORRUPT one is a session to quarantine. Collapsing them would
-    // silently discard a studio's credentials as if they had never connected.
-    await writeFile(path.join(dir, 'creds.json'), '{"truncated":');
+  it('keeps a one-generation backup of the previous credentials', async () => {
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
 
-    const auth = await useAtomicFileAuthState(dir);
-    expect(auth.restored).toBe(false);
-    expect(auth.state.creds.registrationId).toBeTypeOf('number');
+    // First save: nothing to back up yet.
+    await auth.saveCreds();
+    expect(await readdir(dir)).not.toContain('creds.json.bak');
+
+    // Second save: the previous on-disk bytes are rotated into .bak BEFORE the
+    // new ones land, so at every instant at least one valid copy exists.
+    await auth.saveCreds();
+    const files = await readdir(dir);
+    expect(files).toContain('creds.json');
+    expect(files).toContain('creds.json.bak');
+
+    const backup = JSON.parse(await readFile(path.join(dir, 'creds.json.bak'), 'utf8'));
+    expect(backup.registrationId).toBe(auth.state.creds.registrationId);
   });
 
   it('clear() destroys every file but keeps the directory', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
     await auth.saveCreds();
     await auth.state.keys.set({ session: { 'peer-1': new Uint8Array([1]) } });
     expect((await readdir(dir)).length).toBeGreaterThan(0);
@@ -164,7 +174,7 @@ describe('useAtomicFileAuthState', () => {
   });
 
   it('treats an unknown key id as absent rather than throwing', async () => {
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, quarantineDir);
     const got = await auth.state.keys.get('pre-key', ['never-written']);
     expect(got['never-written']).toBeUndefined();
   });

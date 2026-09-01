@@ -17,17 +17,17 @@ third-party provider account.
 
 ## Status
 
-**Phase 3 — Baileys is wired in and pairing is implemented. It has not yet been
-scanned by a real phone.**
+**Phase 4 — pairing is implemented and session persistence is hardened. It has
+not yet been scanned by a real phone.**
 
 | Phase | State |
 |---|---|
 | 0 — Audit of `619-erp-frontend` / `619-erp-backend` | ✅ Done |
 | 1 — Architecture, API contract, security design | ✅ Done |
 | 2 — Service skeleton | ✅ Done |
-| 3 — Baileys QR pairing | ✅ This commit |
-| 4 — Session hardening (quarantine, corruption recovery) | ⬜ Next |
-| 5 — Reconnection backoff | ⬜ |
+| 3 — Baileys QR pairing | ✅ Done |
+| 4 — Session persistence hardening | ✅ This commit |
+| 5 — Reconnection backoff | ⬜ Next |
 | 6–8 — Webhook delivery, ERP integration, UI | ⬜ |
 | 9–13 — Tests, real QR test, Docker, VPS, production | ⬜ |
 
@@ -49,15 +49,16 @@ feature flag is still off, with no socket reaching WhatsApp.
 ```bash
 npm install
 npm run dev        # tsx watch, reads .env
-npm test           # 49 tests, no Redis or WhatsApp needed
+npm test           # 96 tests, no Redis or WhatsApp needed
 npm run typecheck
 npm run lint
 npm run build      # → dist/
 ```
 
 The tests use fakes for Redis and the connector but a **real temp filesystem**
-for the manifest, so atomic writes and restore-after-restart are exercised on
-every run rather than only where they are named.
+for the manifest and session store, so atomic writes, credential round-trips and
+corrupted-session recovery are exercised on every run rather than only where
+they are named.
 
 ## Read this first
 

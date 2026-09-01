@@ -20,6 +20,7 @@ import makeWASocket, {
 import { getLogger, operationLogger } from '../logger.js';
 import { sessionDirFor } from '../store/paths.js';
 import { useAtomicFileAuthState, type AtomicAuthState } from '../store/authState.js';
+import { RecoveryOutcome } from '../store/sessionRecovery.js';
 import type { QrWriter } from '../store/qr.js';
 import type { EventSink } from '../events/outbox.js';
 import { EventType } from '../events/schema.js';
@@ -37,6 +38,8 @@ export interface BaileysConnectorDeps {
    * which case no event is emitted — an event with no tenant is unroutable.
    */
   resolveTenant: (instanceId: string) => string | undefined;
+  /** Where an unrecoverable session directory is preserved (§13.2). */
+  quarantineRoot: string;
   qrTtlSec: number;
   qrMaxRounds: number;
   /** See config.WA_CONNECT_TIMEOUT_MS — why this exists is documented there. */
@@ -178,10 +181,37 @@ export class BaileysConnector implements WhatsAppConnector {
     await this.#closeSocket(runtime, { deliberate: true });
 
     const dir = sessionDirFor(this.#deps.sessionRoot, instanceId);
-    const auth = await useAtomicFileAuthState(dir);
+    const auth = await useAtomicFileAuthState(dir, this.#deps.quarantineRoot);
     runtime.auth = auth;
     runtime.qrRound = 0;
     runtime.closing = false;
+
+    // A quarantined session is not a silent event. The studio WAS paired and
+    // now is not, and the only way back is scanning a new QR — so the ERP has
+    // to be told, or the owner is left looking at a "Connected" card that has
+    // quietly stopped being true.
+    //
+    // Reported as logged_out rather than failed because that is what it means
+    // operationally: the credentials are gone and pairing must start over.
+    if (auth.outcome === RecoveryOutcome.QUARANTINED) {
+      runtime.lastErrorCode = 'session_quarantined';
+      log.error(
+        { status: 'error', quarantine_path: auth.quarantinePath },
+        'session_quarantined — credentials were unrecoverable, a new QR scan is required',
+      );
+      if (tenantId) {
+        await this.#deps.outbox.enqueue(EventType.INSTANCE_LOGGED_OUT, {
+          instanceId,
+          tenantId,
+          payload: { reason_code: 'session_quarantined' },
+        });
+      }
+    } else if (auth.outcome === RecoveryOutcome.RESTORED_FROM_BACKUP) {
+      // Recovered, so no event — nothing changed from the ERP's point of view.
+      // Loud in the log because it means the primary file was damaged, and a
+      // second occurrence on the same instance is a failing volume.
+      log.warn({ status: 'ok' }, 'creds_restored_from_backup');
+    }
 
     const version = await this.#resolveVersion();
 

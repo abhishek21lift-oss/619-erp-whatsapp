@@ -42,6 +42,13 @@ import type {
 } from 'baileys';
 import { atomicWriteFile, ensureDir, exists } from './paths.js';
 import { GatewayError } from '../errors.js';
+import { getLogger } from '../logger.js';
+import {
+  looksLikeCreds,
+  quarantineSession,
+  RecoveryOutcome,
+  type RecoveryOutcomeValue,
+} from './sessionRecovery.js';
 
 export interface AtomicAuthState {
   state: AuthenticationState;
@@ -50,6 +57,10 @@ export interface AtomicAuthState {
   clear: () => Promise<void>;
   /** True when credentials were loaded from disk rather than freshly minted. */
   restored: boolean;
+  /** Exactly what happened on load — see architecture §13.2. */
+  outcome: RecoveryOutcomeValue;
+  /** Where a quarantined session was preserved, when outcome is QUARANTINED. */
+  quarantinePath: string | undefined;
 }
 
 /**
@@ -111,13 +122,28 @@ function createSerializer(): <T>(task: () => Promise<T>) => Promise<T> {
 const CREDS_FILE = 'creds.json';
 
 /**
+ * One generation of backup, and only one.
+ *
+ * Atomic writes already make a torn creds.json impossible, so this covers what
+ * they cannot: filesystem-level corruption, a bad sector, an operator editing
+ * the volume by hand. Keeping more generations would turn the volume into an
+ * archive of account credentials — every extra copy is another place a full
+ * WhatsApp session can leak from, for a diagnostic return that drops sharply
+ * after the immediately-previous version.
+ */
+const BACKUP_FILE = 'creds.json.bak';
+
+/**
  * Open (or create) the auth state for one instance directory.
  *
  * `dir` must already have been resolved through `sessionDirFor`, which is what
  * validates the instance id. This function does not re-derive it — one place
  * owns that check.
  */
-export async function useAtomicFileAuthState(dir: string): Promise<AtomicAuthState> {
+export async function useAtomicFileAuthState(
+  dir: string,
+  quarantineRoot: string,
+): Promise<AtomicAuthState> {
   await ensureDir(dir);
   const serialize = createSerializer();
 
@@ -150,14 +176,56 @@ export async function useAtomicFileAuthState(dir: string): Promise<AtomicAuthSta
     }
   };
 
-  const credsExisted = await exists(path.join(dir, CREDS_FILE));
-  const loaded = await readData<AuthenticationCreds>(CREDS_FILE);
-  const creds: AuthenticationCreds = loaded ?? initAuthCreds();
+  // ── Load credentials, following architecture §13.2 ────────────────────────
+  //
+  // The three outcomes are kept strictly apart because conflating them is how a
+  // working pairing gets destroyed: a corrupt file treated as "first run" mints
+  // fresh credentials, and the next `creds.update` writes them over the only
+  // copy that might still have been recoverable.
+  const credsPath = path.join(dir, CREDS_FILE);
+  const backupPath = path.join(dir, BACKUP_FILE);
 
-  // `restored` distinguishes three situations the connector must tell apart:
-  // no file at all (first pairing), a file that loaded (reconnect, no QR), and
-  // a file that exists but did not parse (corruption — Phase 4 quarantines it).
-  const restored = credsExisted && loaded !== null;
+  const credsExisted = await exists(credsPath);
+  const primary = await readData<AuthenticationCreds>(CREDS_FILE);
+
+  let creds: AuthenticationCreds;
+  let outcome: RecoveryOutcomeValue;
+  let quarantinePath: string | undefined;
+
+  if (!credsExisted) {
+    creds = initAuthCreds();
+    outcome = RecoveryOutcome.FRESH;
+  } else if (primary !== null && looksLikeCreds(primary)) {
+    creds = primary;
+    outcome = RecoveryOutcome.RESTORED;
+  } else {
+    // creds.json exists but is unparseable, or parsed into something that is
+    // not a credential set. Try the one-generation backup before giving up.
+    const backupExists = await exists(backupPath);
+    const backup = backupExists ? await readData<AuthenticationCreds>(BACKUP_FILE) : null;
+
+    if (backup !== null && looksLikeCreds(backup)) {
+      creds = backup;
+      outcome = RecoveryOutcome.RESTORED_FROM_BACKUP;
+      getLogger().warn(
+        { session_dir: dir, operation: 'session.recover' },
+        'creds_restored_from_backup — primary credentials were unusable',
+      );
+      // Promote the backup to primary immediately. Leaving the bad file in
+      // place would mean re-running this recovery on every restart, and a
+      // second corruption would then have no backup left to fall back to.
+      await atomicWriteFile(credsPath, JSON.stringify(creds, BufferJSON.replacer));
+    } else {
+      // Both copies are gone. Preserve the directory rather than delete it —
+      // it is the only artefact that explains what happened (§13.2).
+      quarantinePath = await quarantineSession(dir, quarantineRoot, path.basename(dir));
+      creds = initAuthCreds();
+      outcome = RecoveryOutcome.QUARANTINED;
+    }
+  }
+
+  const restored =
+    outcome === RecoveryOutcome.RESTORED || outcome === RecoveryOutcome.RESTORED_FROM_BACKUP;
 
   const state: AuthenticationState = {
     creds,
@@ -200,10 +268,41 @@ export async function useAtomicFileAuthState(dir: string): Promise<AtomicAuthSta
     },
   };
 
+  /**
+   * Persist credentials, rotating the previous copy into `creds.json.bak`.
+   *
+   * The order is load-bearing. The backup is written from the CURRENT on-disk
+   * bytes *before* the new credentials replace them, so at every instant at
+   * least one valid copy exists:
+   *
+   *   crash before the backup write  → creds.json intact (old)
+   *   crash between the two          → creds.json intact (old), .bak == old
+   *   crash during the creds write   → atomic rename means creds.json is still
+   *                                    old, and .bak is old. Never both torn.
+   *
+   * Doing it the other way round — new creds first, then backup — would leave a
+   * window where creds.json is new and .bak still holds a version two
+   * generations back, which is the copy least likely to be useful.
+   *
+   * A failed backup never blocks the credential write: losing the safety net is
+   * bad, losing the credentials themselves is worse.
+   */
+  const saveCreds = async (): Promise<void> => {
+    try {
+      const current = await readFile(credsPath, 'utf8');
+      await atomicWriteFile(backupPath, current);
+    } catch {
+      /* no previous creds to back up, or the copy failed — proceed regardless */
+    }
+    await writeData(creds, CREDS_FILE);
+  };
+
   return {
     state,
     restored,
-    saveCreds: () => writeData(creds, CREDS_FILE),
+    outcome,
+    quarantinePath,
+    saveCreds,
     /**
      * Remove every file in the instance directory.
      *

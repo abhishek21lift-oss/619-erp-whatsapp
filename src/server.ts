@@ -13,12 +13,22 @@ import { NullConnector } from './domain/nullConnector.js';
 import { BaileysConnector } from './domain/baileysConnector.js';
 import type { WhatsAppConnector } from './domain/instance.js';
 import { ensureDir } from './store/paths.js';
+import { sweepQuarantine } from './store/sessionRecovery.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
 
 /** How long the outbox sweeper waits between passes. See Outbox.reclaimStale. */
 const RECLAIM_INTERVAL_MS = 30_000;
+
+/**
+ * How often quarantined sessions are re-checked against the retention window.
+ *
+ * Daily. The window is measured in days, so anything more frequent is wasted
+ * filesystem walking, and anything less would let a long-lived process hold
+ * expired credential directories well past their retention.
+ */
+const QUARANTINE_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Shutdown budget.
@@ -66,6 +76,7 @@ async function main(): Promise<void> {
           qr,
           outbox,
           resolveTenant: (instanceId) => manifest.get(instanceId)?.organization_id,
+          quarantineRoot: config.WA_QUARANTINE_DIR,
           qrTtlSec: config.WA_QR_TTL_SEC,
           qrMaxRounds: config.WA_QR_MAX_ROUNDS,
           connectTimeoutMs: config.WA_CONNECT_TIMEOUT_MS,
@@ -81,6 +92,18 @@ async function main(): Promise<void> {
     maxInstances: config.WA_MAX_INSTANCES,
   });
 
+  // Sweep BEFORE restoring. A restore can quarantine a fresh directory, and
+  // sweeping afterwards could delete one that is seconds old if the clock or
+  // the retention window were ever misconfigured to zero.
+  await sweepQuarantine(config.WA_QUARANTINE_DIR, config.WA_QUARANTINE_RETENTION_DAYS).catch(
+    (err: Error) => {
+      // Never fatal. Stale credential directories are a liability, but a
+      // failure to tidy them is not a reason to refuse to serve.
+      log.warn({ err: err.message }, 'quarantine_sweep_failed');
+      return { removed: 0, kept: 0 };
+    },
+  );
+
   const restored = await registry.restoreAll();
   log.info({ ...restored, operation: 'boot.restore' }, 'instances_restored');
 
@@ -94,6 +117,16 @@ async function main(): Promise<void> {
   }, RECLAIM_INTERVAL_MS);
   // Never hold the process open on this timer alone.
   sweeper.unref();
+
+  // Quarantined sessions hold dead-but-real WhatsApp device identities, so the
+  // retention window has to be enforced by something that runs, not only at
+  // boot — a gateway that stays up for months would otherwise never sweep.
+  const quarantineSweeper = setInterval(() => {
+    void sweepQuarantine(config.WA_QUARANTINE_DIR, config.WA_QUARANTINE_RETENTION_DAYS).catch(
+      (err: Error) => log.warn({ err: err.message }, 'quarantine_sweep_failed'),
+    );
+  }, QUARANTINE_SWEEP_INTERVAL_MS);
+  quarantineSweeper.unref();
 
   const app = await buildApp({
     config,
@@ -116,6 +149,7 @@ async function main(): Promise<void> {
 
     log.info({ signal }, 'gateway_shutting_down');
     clearInterval(sweeper);
+    clearInterval(quarantineSweeper);
 
     const deadline = setTimeout(() => {
       log.error({ timeout_ms: SHUTDOWN_TIMEOUT_MS }, 'gateway_shutdown_timeout');

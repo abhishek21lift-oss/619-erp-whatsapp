@@ -837,7 +837,34 @@ the volume into an archive of account credentials.
 
 Quarantine rather than delete: a corrupted session is evidence, and deleting it
 destroys the only artefact that explains what happened. Retained
-`WA_QUARANTINE_RETENTION_DAYS` (default 7), then swept.
+`WA_QUARANTINE_RETENTION_DAYS` (default 7), then swept — on boot and daily,
+because a gateway that stays up for months would otherwise never sweep.
+
+**Implemented in Phase 4** (`src/store/sessionRecovery.ts`), with three details
+the diagram above does not capture:
+
+- **"Parses" is not enough.** A truncated write can land on syntactically valid
+  JSON, so `looksLikeCreds` also requires a device identity — the Noise key, the
+  signed identity key, and a numeric registration id. Without that check an
+  `{}` would be handed to Baileys as a session and fail much later, and far less
+  legibly.
+
+- **The backup is written from the current on-disk bytes *before* the new
+  credentials replace them.** That ordering is what guarantees at least one
+  valid copy at every instant; writing the new creds first would leave a window
+  where `.bak` holds a version two generations back — the copy least likely to
+  help.
+
+- **A recovered backup is promoted to primary immediately.** Leaving the damaged
+  file in place would re-run recovery on every restart, and a second corruption
+  would then find no backup left.
+
+The regression this closes is worth naming: before Phase 4 an unparseable
+`creds.json` was swallowed and fresh credentials were minted over it. A studio
+that *was* paired would show as `never_connected`, be invited to scan a new QR,
+and the first `creds.update` after that would overwrite the only copy that might
+still have been recoverable. A transient read error could silently destroy a
+working pairing.
 
 ---
 
@@ -1581,7 +1608,7 @@ becomes a default.
 
 | # | Decision | Recommendation |
 |---|---|---|
-| 1 | Encrypt session state at rest? | **Yes, but Phase 4**, once the happy path is proven. Protects a stolen volume/backup; protects nothing against a live compromise; adds a key whose loss forces a fleet-wide re-scan |
+| 1 | Encrypt session state at rest? | **Deferred to after Phase 10**, not done in Phase 4. The condition this entry set for itself — "once the happy path is proven" — is not met: no real phone has scanned a QR yet. Adding a crypto layer beneath an unproven pairing path means debugging two unknowns at once when Phase 10 first fails, and a lost `WA_SESSION_ENC_KEY` forces a fleet-wide re-scan. §17.2's encrypted off-box backups already cover the realistic leak path (a stolen backup tarball) in the meantime |
 | 2 | `baileys@7.0.0-rc14` or `6.7.24`? | **rc14**, pinned exactly. §21.1 — and it is a close call, not an obvious one |
 | 3 | Repository visibility | **Private**, unless there is a reason otherwise. No secrets either way |
 | 4 | Encrypted off-box session backups | **Yes** — `age` + off-box, 7 daily. §17.2 |
