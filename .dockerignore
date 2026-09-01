@@ -1,0 +1,45 @@
+# Keep the build context small and the image clean.
+#
+# The first two entries are the ones that matter for more than speed.
+
+# ── Session credentials — must NEVER enter a build context ──────────────────
+#
+# A local /data holds real Baileys auth state: full WhatsApp account access.
+# Anything in the build context can end up in a layer, and a layer is
+# distributable. .gitignore covers the repo; this covers the image.
+data/
+sessions/
+*.session
+creds.json
+*creds*.json
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Rebuilt inside the image ────────────────────────────────────────────────
+#
+# node_modules especially: copying a host-built tree in would defeat `npm ci`
+# and could carry native artefacts compiled for a different libc.
+node_modules/
+dist/
+
+# ── Not needed at runtime ───────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+docs/
+README.md
+*.md
+src/__tests__/
+vitest.config.ts
+eslint.config.js
+tsconfig.check.json
+coverage/
+.nyc_output/
+*.log
+tmp/
+.DS_Store

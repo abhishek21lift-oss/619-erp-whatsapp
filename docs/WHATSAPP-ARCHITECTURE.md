@@ -1163,20 +1163,55 @@ The full runbook is `docs/DEPLOYMENT.md` (Phase 12). Order and rationale:
    ```
    docker compose exec backend node -e \
      "fetch('http://myptstudio-whatsapp:8080/healthz').then(r=>console.log(r.status))"
-   curl -sS --max-time 5 https://wa-api.myptstudio.com/healthz   # must FAIL
+   # The negative check must probe something that WOULD answer if the service
+   # were exposed. `wa-api.myptstudio.com` has no DNS record, so curling it
+   # fails on name resolution whether or not the gateway is published — a
+   # falsely reassuring test. Probe the port on the box's own public address:
+   curl -sS --max-time 5 http://<public-ip>:8080/healthz   # must FAIL
    ```
 5. Deploy the backend (migration 185 runs before the container serves, per the
-   existing deploy script) **with the WhatsApp feature flag off**.
+   existing deploy script) **with `WA_GATEWAY_URL` still unset** — the card then
+   reports "not set up on this server" and nothing can be paired. This replaces
+   "with the feature flag off"; see the correction in §16.3.
 6. Deploy the frontend.
-7. Enable for **one** studio. Real QR scan (Phase 10).
+7. Set `WA_GATEWAY_URL`, restart the backend, and tell **one** studio. No
+   instance exists until somebody presses Connect, so telling one studio is what
+   "enable for one studio" means here. Real QR scan (Phase 10).
 8. Widen only after that studio has stayed connected across a deliberate
    `docker compose restart whatsapp`.
 
-### 16.3 Feature flag
+### 16.3 Feature flag — CORRECTED after Phase 7
 
-The ERP already has a feature manager (migration 123) with an `integrations`
-feature. The WhatsApp card ships behind a flag so step 7 is a database update,
-not a deploy — and so the rollback in §17.3 is instant.
+This section planned a **WhatsApp-specific** flag, so that enabling one studio
+(step 7) and rolling back (§17.3) were both database updates. **That is not what
+shipped, and the difference matters for both.**
+
+What shipped is the existing shared gate:
+
+```js
+app.use('/api/integrations/whatsapp', ...gate('integrations'), require('./routes/whatsapp'));
+```
+
+`requireFeature('integrations')` (`lib/features.js`) resolves the `integrations`
+feature for the org — the same flag that governs **every** integration. Turning
+it off to disable WhatsApp for one studio would take their other integrations
+with it, so it is not the per-studio switch this section described.
+
+No WhatsApp-specific flag was added, deliberately: the brief's rule is no
+speculative changes to existing production functionality, and adding a feature
+key to a shared feature manager to serve a component that has never paired is
+exactly that. It remains the right follow-up **once Phase 10 has passed** and
+there is a reason to widen past one studio.
+
+So the two things that section promised are actually delivered by:
+
+- **Enabling one studio (step 7)** — operational, not technical. An instance
+  exists only once a studio presses **Connect**; until then the gateway holds
+  nothing for them. Tell one studio, and no other studio is affected.
+- **Instant rollback (§17.3)** — unsetting `WA_GATEWAY_URL` on the backend. That
+  is deployment-wide rather than per-studio, and it needs a backend restart
+  (seconds) rather than being a pure database write. `docs/DEPLOYMENT.md` §11
+  is the accurate ladder.
 
 ---
 
@@ -1215,7 +1250,7 @@ docker run --rm \
 
 | Scope | Action | Effect |
 |---|---|---|
-| Disable the feature | Toggle the flag off | Card hidden. Sockets keep running. **Instant, no deploy** |
+| Disable the integration | Unset `WA_GATEWAY_URL`, `docker compose up -d backend` | Card reports "not set up on this server". Sockets keep running. Seconds, no rebuild. **Deployment-wide** — there is no per-studio WhatsApp flag, see §16.3 |
 | Stop the gateway | `docker compose stop whatsapp` | Backend serves `stale: true`. Twilio path untouched — the ERP's existing WhatsApp keeps working |
 | Roll back backend/frontend | Existing `rollback.yml` | Unchanged |
 | Remove entirely | Stop, remove the service, **keep the volume** | Never `docker volume rm` on a rollback: it destroys sessions and forces a fleet-wide re-scan |

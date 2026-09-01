@@ -228,6 +228,7 @@ about.
 | Real WhatsApp pairing | No egress in CI or the build environment | Phase 10, §4 |
 | Per-instance memory of a **connected** session | Same | Phase 10, §6 |
 | The connect watchdog | Would have to either reach WhatsApp or fail to, and which one CI does is not something this repo controls. A test that passes for the wrong reason is worse than none | Verified by hand in Phase 3 against a blocked network |
-| Docker healthcheck | Needs a built image | Phase 11 |
+| A built Docker image | The build environment cannot reach Docker Hub: `production.cloudfront.docker.com:443` is policy-denied at the egress proxy, and no base image is cached. So `docker build` has **never run** against this Dockerfile | First step of deployment — `docs/DEPLOYMENT.md` §1 |
+| Docker healthcheck **in a container** | Same. The command itself was run verbatim outside one (exit 0 healthy / 1 unhealthy), and the service was run as uid 1001 against a `0700` volume with `/readyz` answering — but `HEALTHCHECK` as Docker executes it is unproven | `docs/DEPLOYMENT.md` §1 |
 | Two gateway containers racing one instance | The single-owner Redis lock is designed (§11.3) but the MVP runs one replica, so there is nothing to race | Before ever scaling to two |
 | `keyboard-access.test.ts` false positives | It scans raw source without stripping comments — prose describing markup reads as markup. `rls.convention.test.js` documents fixing exactly this class in the backend | Follow-up in `619-erp-frontend`, not bundled here |
