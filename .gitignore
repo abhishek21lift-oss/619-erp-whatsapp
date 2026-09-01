@@ -1,0 +1,41 @@
+# ── WhatsApp session state — NEVER COMMIT ───────────────────────────────────
+#
+# These directories hold Baileys authentication state: device identity, Signal
+# identity keys, pre-keys and app-state sync keys. That is FULL ACCESS to the
+# linked WhatsApp account. A commit here is an account compromise, and one that
+# survives in git history after the file is deleted.
+#
+# Listed first, and deliberately broad, because the cost of a false positive
+# (an ignored file you meant to track) is trivial next to the alternative.
+data/
+sessions/
+*.session
+creds.json
+*creds*.json
+app-state-sync-key-*.json
+pre-key-*.json
+sender-key-*.json
+session-*.json
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Build output ────────────────────────────────────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+
+# ── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Logs / coverage / scratch ───────────────────────────────────────────────
+*.log
+npm-debug.log*
+coverage/
+.nyc_output/
+tmp/
+.DS_Store
