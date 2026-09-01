@@ -17,8 +17,9 @@ third-party provider account.
 
 ## Status
 
-**Phase 7 — the gateway and the ERP backend are integrated end to end. It has
-not yet been scanned by a real phone.**
+**Phase 9 — all three repos are integrated and tested. It has not yet been
+scanned by a real phone, and until it has, none of that is evidence it can
+pair.**
 
 | Phase | State |
 |---|---|
@@ -30,8 +31,10 @@ not yet been scanned by a real phone.**
 | 5 — Connection lifecycle / reconnect backoff | ✅ Done |
 | 6 — Signed webhook delivery to the backend | ✅ Done |
 | 7 — ERP backend integration | ✅ Done (in `619-erp-backend`) |
-| 8 — Settings → Integrations UI | ⬜ Next |
-| 9–13 — Tests, real QR test, Docker, VPS, production | ⬜ |
+| 8 — Settings → Integrations UI | ✅ Done (in `619-erp-frontend`) |
+| 9 — Automated tests | ✅ This commit — see [docs/TESTING.md](docs/TESTING.md) |
+| 10 — **Real phone QR scan** | ⬜ Next — the only thing that proves this works |
+| 11–13 — Docker, VPS, production | ⬜ |
 
 ### What "not yet scanned" means
 
@@ -40,7 +43,10 @@ The build environment's egress proxy blocks `web.whatsapp.com` with a 403, so
 boundary is verified — the socket opens, the version negotiates, auth state
 round-trips, the watchdog fires, tenant isolation holds — but a real pairing is
 Phase 10, on a host with egress, and **passing tests are not evidence that a
-phone can scan this.** See §21.4 of the architecture.
+phone can scan this.**
+
+The procedure for that test, and the list of what it must check beyond "the QR
+scanned", is [docs/TESTING.md §4](docs/TESTING.md).
 
 `WA_CONNECTOR=null` runs the whole service with pairing inert, which is what
 rollout step 5 needs: the gateway can stand up alongside a backend whose
@@ -51,7 +57,7 @@ feature flag is still off, with no socket reaching WhatsApp.
 ```bash
 npm install
 npm run dev        # tsx watch, reads .env
-npm test           # 144 tests, no Redis or WhatsApp needed
+npm test           # 154 tests, no Redis or WhatsApp needed
 npm run typecheck
 npm run lint
 npm run build      # → dist/
