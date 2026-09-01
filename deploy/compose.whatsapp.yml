@@ -29,10 +29,8 @@ services:
     volumes:
       - whatsapp-sessions:/data
 
-    # Attach explicitly to the same external Docker network as the existing
-    # backend/Redis services. WA_NETWORK_NAME is resolved by the deployment
-    # workflow from the already-running backend container, so we never guess
-    # or rename the production network.
+    # Use the existing production ERP network. The deployment workflow resolves
+    # WA_NETWORK_NAME to the network already shared by Redis and backend.
     networks:
       myptstudio_network:
         aliases:
