@@ -349,17 +349,51 @@ delay = min(WA_RECONNECT_BASE_MS * 2^attempt, WA_RECONNECT_MAX_MS)
 sleep   random(0, delay)          // full jitter
 ```
 
-Defaults: base **2 000 ms**, ceiling **300 000 ms** (5 min), **`WA_RECONNECT_MAX_ATTEMPTS` = 10**
-→ roughly 25 minutes of trying before the instance goes `failed`.
+Defaults: base **2 000 ms**, ceiling **300 000 ms** (5 min),
+**`WA_RECONNECT_MAX_ATTEMPTS` = 10**. The per-attempt ceilings are then
+2 s, 4, 8, 16, 32, 64, 128, 256, 300, 300 — so:
+
+| | Time before `failed` |
+|---|---|
+| Worst case (every jitter roll at the top) | **18.5 minutes** |
+| **Typical** (jitter averages half its ceiling) | **≈ 9 minutes** |
+
+> **Corrected in Phase 5.** This section claimed "roughly 25 minutes". It is
+> not, in either reading, and the error was caught by a test written to pin the
+> number precisely so the docs and the defaults could not drift apart. An
+> operator who reads 25 minutes, waits 20 and then restarts the container has
+> been misled by the documentation rather than the code. `maxBackoffWindowMs`
+> and `expectedBackoffWindowMs` in `src/domain/backoff.ts` compute both figures,
+> and `backoff.test.ts` asserts them.
 
 Full jitter, not fixed backoff, because a gateway restart would otherwise
 reconnect every studio in lockstep — a self-inflicted thundering herd against
 WhatsApp's servers from one IP, which is exactly the traffic shape that gets an
 IP rate-limited.
 
+**One documented deviation from the formula above:** the delay is floored at
+`MIN_RECONNECT_DELAY_MS` (500 ms). Full jitter draws from `[0, ceiling]` and can
+legitimately roll a few milliseconds; reconnecting 3 ms after WhatsApp dropped
+the socket is not a retry, it is a hammer, and hammering is one of the patterns
+that gets a number flagged (§19). The floor only binds on the shortest rolls of
+the earliest attempts.
+
 `failed` is not terminal for the *credentials*: `POST …/reconnect` resets the
-attempt counter and tries again. It only means the gateway has stopped
-retrying on its own.
+attempt counter and tries again, and the session is still on disk — so recovery
+does not require a new QR. It only means the gateway has stopped retrying on its
+own.
+
+The budget is restored on **two** events, and both matter:
+
+- **a successful connection**, or an instance that flapped nine times over a
+  month would give up on its tenth ever disconnect;
+- **an operator's `POST /reconnect`**, or `failed` would be permanent and the
+  Reconnect button a lie.
+
+A `connect_timeout` (§21.4's watchdog) is fed through this same loop rather than
+dead-ending at `failed`. Lost egress to WhatsApp is usually temporary — a
+firewall change, a DNS blip — and recovering without anyone pressing anything is
+the point of the loop. If it is permanent, the attempt budget still bounds it.
 
 ---
 

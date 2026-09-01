@@ -80,6 +80,9 @@ async function main(): Promise<void> {
           qrTtlSec: config.WA_QR_TTL_SEC,
           qrMaxRounds: config.WA_QR_MAX_ROUNDS,
           connectTimeoutMs: config.WA_CONNECT_TIMEOUT_MS,
+          reconnectBaseMs: config.WA_RECONNECT_BASE_MS,
+          reconnectMaxMs: config.WA_RECONNECT_MAX_MS,
+          reconnectMaxAttempts: config.WA_RECONNECT_MAX_ATTEMPTS,
         })
       : new NullConnector();
   log.info({ connector: config.WA_CONNECTOR }, 'connector_selected');

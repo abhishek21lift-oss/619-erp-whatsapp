@@ -1,13 +1,19 @@
 // The Baileys implementation of WhatsAppConnector (architecture §3, §4, §5).
 //
-// Phase 3 delivers QR pairing end to end: open a socket, surface the QR, detect
-// a successful scan, persist the credentials, and report `connected`.
+// The full connection lifecycle: open a socket, surface the QR, detect a
+// successful scan, persist credentials, classify every disconnect, and
+// reconnect with bounded exponential backoff.
 //
-// Deliberately NOT here, and marked at each site:
-//   • the exponential-backoff reconnect loop        → Phase 5
-//   • corrupted-session quarantine and recovery     → Phase 4
-// The close path already classifies every reason (domain/disconnect.ts) so that
-// Phase 5 adds a scheduler rather than rewriting this file.
+// Three pieces of it live in their own modules, because each is a decision
+// worth testing without a WhatsApp connection attached:
+//
+//   domain/disconnect.ts         — what a close code means and what to do
+//   domain/backoff.ts            — how long to wait, and why jittered
+//   domain/reconnectScheduler.ts — the per-instance budget and its timer
+//   store/sessionRecovery.ts     — corrupted-session detection and quarantine
+//
+// What remains here is the wiring, and the socket options — several of which
+// are non-default for reasons documented at the call site.
 
 import makeWASocket, {
   Browsers,
@@ -26,6 +32,7 @@ import type { EventSink } from '../events/outbox.js';
 import { EventType } from '../events/schema.js';
 import { InstanceState, type InstanceStateValue, type WhatsAppConnector } from './instance.js';
 import { classifyDisconnect, disconnectStatusCode } from './disconnect.js';
+import { ReconnectScheduler } from './reconnectScheduler.js';
 
 export interface BaileysConnectorDeps {
   sessionRoot: string;
@@ -44,6 +51,10 @@ export interface BaileysConnectorDeps {
   qrMaxRounds: number;
   /** See config.WA_CONNECT_TIMEOUT_MS — why this exists is documented there. */
   connectTimeoutMs: number;
+  /** Backoff parameters — architecture §5.2. */
+  reconnectBaseMs: number;
+  reconnectMaxMs: number;
+  reconnectMaxAttempts: number;
 }
 
 interface Runtime {
@@ -61,9 +72,11 @@ interface Runtime {
   starting: Promise<InstanceStateValue> | undefined;
   /** Fires if the socket produces no signal at all. See #armConnectWatchdog. */
   watchdog: NodeJS.Timeout | undefined;
+  /** The reconnection budget and its armed timer. See reconnectScheduler.ts. */
+  reconnect: ReconnectScheduler;
 }
 
-function newRuntime(): Runtime {
+function newRuntime(reconnect: ReconnectScheduler): Runtime {
   return {
     sock: undefined,
     auth: undefined,
@@ -76,6 +89,7 @@ function newRuntime(): Runtime {
     closing: false,
     starting: undefined,
     watchdog: undefined,
+    reconnect,
   };
 }
 
@@ -111,7 +125,26 @@ export class BaileysConnector implements WhatsAppConnector {
   #runtime(instanceId: string): Runtime {
     let runtime = this.#runtimes.get(instanceId);
     if (!runtime) {
-      runtime = newRuntime();
+      const scheduler = new ReconnectScheduler({
+        baseMs: this.#deps.reconnectBaseMs,
+        maxMs: this.#deps.reconnectMaxMs,
+        maxAttempts: this.#deps.reconnectMaxAttempts,
+        onRetry: () => {
+          // #startInner, NOT start(): the public entry point resets the
+          // budget, which is right for an operator asking again and wrong
+          // here — a self-retry that reset its own budget would loop forever.
+          const current = this.#runtimes.get(instanceId);
+          if (!current) return;
+          void this.#startInner(instanceId, current).catch((err: Error) => {
+            operationLogger({
+              instance_id: instanceId,
+              tenant_id: this.#deps.resolveTenant(instanceId),
+              operation: 'connector.reconnect_attempt',
+            }).error({ status: 'error', err: err.message }, 'reconnect_attempt_failed');
+          });
+        },
+      });
+      runtime = newRuntime(scheduler);
       this.#runtimes.set(instanceId, runtime);
     }
     return runtime;
@@ -149,8 +182,22 @@ export class BaileysConnector implements WhatsAppConnector {
     return this.#version;
   }
 
+  /**
+   * Start (or restart) an instance at an operator's request.
+   *
+   * The PUBLIC entry point, and the difference from the internal retry path is
+   * the budget: this resets `reconnectAttempt` to zero. An operator pressing
+   * Reconnect — or a fresh process restoring on boot — is asking for a clean
+   * slate, and `failed` exists precisely so that ask is meaningful. The
+   * automatic retry calls `#startInner` instead, so a self-retry cannot reset
+   * its own budget and loop forever.
+   */
   async start(instanceId: string): Promise<InstanceStateValue> {
     const runtime = this.#runtime(instanceId);
+
+    // Cancel any armed backoff. Without this an operator's immediate reconnect
+    // would race the scheduled one and open two sockets for one instance.
+    runtime.reconnect.reset();
 
     // Two callers can reach this at once — a restore sweep and an API
     // reconnect, say. Without this the second would build a second socket for
@@ -315,20 +362,19 @@ export class BaileysConnector implements WhatsAppConnector {
       'whatsapp_no_response — check egress to WhatsApp from this host',
     );
 
-    runtime.state = InstanceState.FAILED;
     runtime.lastErrorCode = 'connect_timeout';
     runtime.disconnectedAt = new Date().toISOString();
 
     await this.#closeSocket(runtime, { deliberate: true });
     await this.#deps.qr.clear(instanceId);
 
-    if (tenantId) {
-      await this.#deps.outbox.enqueue(EventType.INSTANCE_DISCONNECTED, {
-        instanceId,
-        tenantId,
-        payload: { reason_code: 'connect_timeout', will_retry: false, next_retry_at: null },
-      });
-    }
+    // Retried through the same backoff loop as any other transient failure.
+    // A blocked egress is usually temporary — a firewall change, a DNS blip —
+    // and recovering without an operator pressing anything is the whole point
+    // of the loop. If it is permanent, the attempt budget still bounds it, and
+    // the instance lands in `failed` with this reason code attached.
+    const schedule = this.#scheduleReconnect(instanceId, runtime, 'connect_timeout');
+    await this.#emitDisconnected(instanceId, tenantId, 'connect_timeout', schedule);
   }
 
   async #onConnectionUpdate(
@@ -351,6 +397,10 @@ export class BaileysConnector implements WhatsAppConnector {
       this.#clearWatchdog(runtime);
       runtime.state = InstanceState.CONNECTED;
       runtime.qrRound = 0;
+      // A successful connection is what "recovered" means, so the budget is
+      // restored. Otherwise an instance that flapped nine times over a month
+      // would give up on its tenth ever disconnect.
+      runtime.reconnect.reset();
       runtime.connectedAt = new Date().toISOString();
       runtime.disconnectedAt = null;
       runtime.lastErrorCode = null;
@@ -471,6 +521,10 @@ export class BaileysConnector implements WhatsAppConnector {
     }
 
     if (verdict.action === 'logout') {
+      // Retrying with credentials WhatsApp has invalidated is how an account
+      // gets flagged. Any armed timer from an earlier transient failure dies
+      // here too.
+      runtime.reconnect.cancel();
       await this.#destroyCredentials(runtime);
       await this.#deps.qr.clear(instanceId);
       runtime.phoneE164 = null;
@@ -486,25 +540,83 @@ export class BaileysConnector implements WhatsAppConnector {
       return;
     }
 
-    // 'retry' and 'stop'.
-    //
-    // Phase 5 turns 'retry' into the exponential-backoff loop from §5.2. Until
-    // then `will_retry` is reported as false, which is the truth — and the
-    // truth is what the ERP's UI renders. Claiming a retry that will not happen
-    // would leave a studio watching a spinner forever.
     await this.#deps.qr.clear(instanceId);
-    if (tenantId) {
-      await this.#deps.outbox.enqueue(EventType.INSTANCE_DISCONNECTED, {
-        instanceId,
-        tenantId,
-        payload: {
-          reason_code: verdict.reasonCode,
-          will_retry: false,
-          next_retry_at: null,
-        },
+
+    // 'stop' means a retry would make things worse, not better — the number was
+    // paired elsewhere, or WhatsApp refused the account. Standing down is the
+    // action; the state the classifier chose already says so.
+    if (verdict.action === 'stop') {
+      await this.#emitDisconnected(instanceId, tenantId, verdict.reasonCode, {
+        willRetry: false,
+        nextRetryAt: null,
       });
+      return;
     }
+
+    // 'retry' → the backoff loop (§5.2).
+    const schedule = this.#scheduleReconnect(instanceId, runtime, verdict.reasonCode);
+    await this.#emitDisconnected(instanceId, tenantId, verdict.reasonCode, schedule);
   }
+
+  /**
+   * Arm the next reconnection attempt, or give up.
+   *
+   * Returns what the ERP should be told, so `will_retry` and `next_retry_at`
+   * describe a timer that actually exists. That honesty is the point: the UI
+   * renders these directly, and claiming a retry that was never scheduled
+   * leaves a studio watching a countdown to nothing.
+   */
+  #scheduleReconnect(
+    instanceId: string,
+    runtime: Runtime,
+    reasonCode: string,
+  ): { willRetry: boolean; nextRetryAt: string | null } {
+    const log = operationLogger({
+      instance_id: instanceId,
+      tenant_id: this.#deps.resolveTenant(instanceId),
+      operation: 'connector.reconnect_schedule',
+    });
+
+    const result = runtime.reconnect.schedule();
+
+    if (!result.willRetry) {
+      // Not terminal for the CREDENTIALS — `failed` only means the gateway has
+      // stopped trying by itself. POST /reconnect resets the budget and the
+      // session is still on disk, so recovery does not require a new QR.
+      runtime.state = InstanceState.FAILED;
+      log.error(
+        { status: 'error', attempts: runtime.reconnect.attempt, reason: reasonCode },
+        'reconnect_attempts_exhausted',
+      );
+      return { willRetry: false, nextRetryAt: null };
+    }
+
+    runtime.state = InstanceState.RECONNECTING;
+    log.info(
+      { status: 'ok', attempt: result.attempt, delay_ms: result.delayMs, reason: reasonCode },
+      'reconnect_scheduled',
+    );
+    return { willRetry: true, nextRetryAt: result.nextRetryAt };
+  }
+
+  async #emitDisconnected(
+    instanceId: string,
+    tenantId: string | undefined,
+    reasonCode: string,
+    schedule: { willRetry: boolean; nextRetryAt: string | null },
+  ): Promise<void> {
+    if (!tenantId) return;
+    await this.#deps.outbox.enqueue(EventType.INSTANCE_DISCONNECTED, {
+      instanceId,
+      tenantId,
+      payload: {
+        reason_code: reasonCode,
+        will_retry: schedule.willRetry,
+        next_retry_at: schedule.nextRetryAt,
+      },
+    });
+  }
+
 
   async #destroyCredentials(runtime: Runtime): Promise<void> {
     try {
@@ -542,6 +654,9 @@ export class BaileysConnector implements WhatsAppConnector {
 
   async stop(instanceId: string): Promise<void> {
     const runtime = this.#runtime(instanceId);
+    // An operator disconnect must not be undone thirty seconds later by a
+    // backoff timer armed before they pressed the button.
+    runtime.reconnect.reset();
     await this.#closeSocket(runtime, { deliberate: true });
     runtime.state = InstanceState.DISCONNECTED;
     runtime.disconnectedAt = new Date().toISOString();
@@ -566,6 +681,7 @@ export class BaileysConnector implements WhatsAppConnector {
       }
     }
 
+    runtime.reconnect.cancel();
     runtime.closing = true;
     await this.#closeSocket(runtime, { deliberate: true });
     await this.#destroyCredentials(runtime);
@@ -603,9 +719,12 @@ export class BaileysConnector implements WhatsAppConnector {
    */
   async shutdown(): Promise<void> {
     await Promise.all(
-      [...this.#runtimes.values()].map((runtime) =>
-        this.#closeSocket(runtime, { deliberate: true }).catch(() => undefined),
-      ),
+      [...this.#runtimes.values()].map((runtime) => {
+        // Cancel before closing: a timer that fires mid-shutdown would open a
+        // new socket behind the teardown and leave it dangling.
+        runtime.reconnect.cancel();
+        return this.#closeSocket(runtime, { deliberate: true }).catch(() => undefined);
+      }),
     );
     this.#runtimes.clear();
   }
