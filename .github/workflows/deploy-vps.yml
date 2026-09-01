@@ -1,0 +1,78 @@
+name: Deploy WhatsApp Gateway to VPS
+
+on:
+  push:
+    branches:
+      - feature/whatsapp-gateway-mvp
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps-whatsapp
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy gateway to MY PT STUDIO VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: |
+            set -e
+            cd /opt/myptstudio
+
+            # Keep the gateway repository beside the existing ERP repositories.
+            if [ ! -d /opt/myptstudio/619-erp-whatsapp/.git ]; then
+              git clone https://github.com/abhishek21lift-oss/619-erp-whatsapp.git /opt/myptstudio/619-erp-whatsapp
+            fi
+
+            cd /opt/myptstudio/619-erp-whatsapp
+            git fetch origin feature/whatsapp-gateway-mvp
+            git checkout feature/whatsapp-gateway-mvp
+            git reset --hard origin/feature/whatsapp-gateway-mvp
+
+            cd /opt/myptstudio
+
+            # Never expose the gateway publicly. It is reachable only from the
+            # Docker network by the ERP backend.
+            docker compose config --services | grep -qx 'redis'
+            docker compose config --services | grep -qx 'backend'
+
+            # Generate the two shared secrets only if they do not already exist.
+            touch /opt/myptstudio/.env
+            chmod 600 /opt/myptstudio/.env
+            if ! grep -q '^WA_GATEWAY_KEY=' /opt/myptstudio/.env; then
+              printf '\nWA_GATEWAY_KEY=%s\n' "$(openssl rand -hex 32)" >> /opt/myptstudio/.env
+            fi
+            if ! grep -q '^WA_WEBHOOK_SECRET=' /opt/myptstudio/.env; then
+              printf 'WA_WEBHOOK_SECRET=%s\n' "$(openssl rand -hex 32)" >> /opt/myptstudio/.env
+            fi
+            if ! grep -q '^WA_BACKEND_URL=' /opt/myptstudio/.env; then
+              printf 'WA_BACKEND_URL=http://myptstudio-backend:5000\n' >> /opt/myptstudio/.env
+            fi
+            if ! grep -q '^WA_CONNECTOR=' /opt/myptstudio/.env; then
+              printf 'WA_CONNECTOR=baileys\n' >> /opt/myptstudio/.env
+            fi
+
+            # Validate the production compose plus the repository's gateway fragment
+            # before changing or starting anything.
+            docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml config >/dev/null
+
+            # Build and start only the WhatsApp gateway. The base ERP services are
+            # not rebuilt or restarted by this deployment.
+            docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml build whatsapp
+            docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml up -d whatsapp
+
+            # Verify liveness, health and that no host port was published.
+            docker inspect --format '{{.State.Health.Status}}' myptstudio-whatsapp
+            docker inspect --format '{{json .NetworkSettings.Ports}}' myptstudio-whatsapp
+            docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml ps whatsapp
+            docker exec myptstudio-whatsapp node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1);return r.json()}).then(console.log)"
+
+            printf '%s\n' '${{ github.sha }}' > /opt/myptstudio/.whatsapp-deployed-sha
