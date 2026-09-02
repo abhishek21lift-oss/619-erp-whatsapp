@@ -88,7 +88,30 @@ export const configSchema = z.object({
   WA_MAX_INSTANCES: intFromEnv(50, 1, 1000),
 
   WA_QR_TTL_SEC: intFromEnv(60, 10, 300),
+
+  /** Per-socket QR round guard. See WA_PAIRING_MAX_ROUNDS for the one that binds. */
   WA_QR_MAX_ROUNDS: intFromEnv(5, 1, 20),
+
+  /**
+   * How many QR rounds one PAIRING SESSION may offer in total, across however
+   * many sockets it takes.
+   *
+   * ── Why a second, session-wide budget ──────────────────────────────────────
+   *
+   * WhatsApp closes an unscanned pairing socket with 428 after about four QR
+   * rounds. That is not a failure — it is how WhatsApp expires a QR session,
+   * and WhatsApp Web answers it by showing a fresh code. So the connector
+   * answers it by opening a new socket immediately, which resets the per-socket
+   * WA_QR_MAX_ROUNDS counter every time and would otherwise let one pairing
+   * attempt offer codes forever. Hammering WhatsApp is how a number gets
+   * flagged (§19), so the bound has to live somewhere the restart cannot reset.
+   *
+   * Ten rounds at WA_QR_TTL_SEC each is about ten minutes of continuously
+   * scannable code — long enough to find a phone and open Linked Devices,
+   * bounded enough that an abandoned modal stops on its own. Spending it moves
+   * the instance to `qr_timeout`, which Connect/Reconnect recovers from.
+   */
+  WA_PAIRING_MAX_ROUNDS: intFromEnv(10, 1, 60),
 
   /**
    * How long a new socket may produce NO signal at all before we give up.

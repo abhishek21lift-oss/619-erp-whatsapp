@@ -80,6 +80,7 @@ async function main(): Promise<void> {
           quarantineRoot: config.WA_QUARANTINE_DIR,
           qrTtlSec: config.WA_QR_TTL_SEC,
           qrMaxRounds: config.WA_QR_MAX_ROUNDS,
+          pairingMaxRounds: config.WA_PAIRING_MAX_ROUNDS,
           connectTimeoutMs: config.WA_CONNECT_TIMEOUT_MS,
           reconnectBaseMs: config.WA_RECONNECT_BASE_MS,
           reconnectMaxMs: config.WA_RECONNECT_MAX_MS,

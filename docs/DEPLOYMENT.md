@@ -242,7 +242,8 @@ beginning of `docs/TESTING.md` §4.
 | `WA_QUARANTINE_DIR` | no | `/data/quarantine` | On the volume |
 | `WA_MAX_INSTANCES` | no | `50` | **Untested** — §12 |
 | `WA_QR_TTL_SEC` | no | `60` | |
-| `WA_QR_MAX_ROUNDS` | no | `5` | |
+| `WA_QR_MAX_ROUNDS` | no | `5` | Per-socket QR round cap. |
+| `WA_PAIRING_MAX_ROUNDS` | no | `10` | Rounds one pairing session may offer in total. ~10 minutes of scannable code. |
 | `WA_CONNECT_TIMEOUT_MS` | no | `45000` | Watchdog for a socket that emits no event at all |
 | `WA_CONNECTOR` | no | `baileys` | `null` = everything runs, pairing inert |
 

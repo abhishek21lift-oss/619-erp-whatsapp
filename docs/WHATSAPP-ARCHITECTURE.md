@@ -234,9 +234,26 @@ gives up after a few rounds. The gateway:
 - returns `410 Gone` with `{ code: 'QR_EXPIRED' }` when the key is absent and
   the instance is not connected, so the UI shows "QR expired — try again"
   rather than an infinite spinner;
-- caps a pairing attempt at **`WA_QR_MAX_ROUNDS` (default 5)**, then closes the
-  socket and moves the instance to `qr_timeout`. An abandoned modal must not
-  leave a socket open forever.
+- caps one SOCKET at **`WA_QR_MAX_ROUNDS` (default 5)** rounds and one PAIRING
+  SESSION at **`WA_PAIRING_MAX_ROUNDS` (default 10)**, then closes the socket
+  and moves the instance to `qr_timeout`. An abandoned modal must not leave a
+  socket open forever.
+
+Two budgets, because WhatsApp itself ends an unscanned pairing socket with a
+**428** after roughly four rounds. That is not a failure — WhatsApp Web answers
+it by showing a fresh code — so the connector reopens immediately rather than
+handing it to the reconnect backoff of §5.2. The per-socket counter resets on
+that reopen, so the session-wide budget is the one that actually stops an
+abandoned pairing; without it the gateway would offer codes forever, which is
+the traffic pattern §19 warns gets a number flagged.
+
+Treating that 428 as a connection failure is not hypothetical: it shipped, and
+it made pairing impossible. Each unscanned round burned one reconnect attempt,
+so the gap between one code vanishing and the next appearing grew exponentially
+to `WA_RECONNECT_MAX_MS`; production logs show `attempt: 10, delay_ms: 86680`,
+an 87-second window with no QR stored at all, and then
+`reconnect_attempts_exhausted` → `failed`, after which no code was offered
+again. The studio saw a dialog stuck on "Waiting for a code…".
 
 ---
 
@@ -1712,7 +1729,8 @@ ALTER TABLE communication_logs ADD COLUMN IF NOT EXISTS provider TEXT;  -- 'twil
 | `WA_SESSION_DIR` | `/data/sessions` | On the volume |
 | `WA_MAX_INSTANCES` | `50` | Set from Phase 9 measurement, not this default |
 | `WA_QR_TTL_SEC` | `60` | |
-| `WA_QR_MAX_ROUNDS` | `5` | |
+| `WA_QR_MAX_ROUNDS` | `5` | Per-socket QR round cap. |
+| `WA_PAIRING_MAX_ROUNDS` | `10` | Rounds one pairing session may offer across all its sockets. This is the bound that binds — see §3. |
 | `WA_CONNECT_TIMEOUT_MS` | `45000` | Watchdog for a socket that produces no event at all — see §21.4. Added in Phase 3 |
 | `WA_CONNECTOR` | `baileys` | `null` runs the service with pairing inert. This is what rollout step 5 in §16.2 needs |
 | `WA_RECONNECT_BASE_MS` | `2000` | |

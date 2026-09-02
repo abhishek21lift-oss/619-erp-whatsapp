@@ -49,6 +49,8 @@ export interface BaileysConnectorDeps {
   quarantineRoot: string;
   qrTtlSec: number;
   qrMaxRounds: number;
+  /** Session-wide QR budget — see config.WA_PAIRING_MAX_ROUNDS. */
+  pairingMaxRounds: number;
   /** See config.WA_CONNECT_TIMEOUT_MS — why this exists is documented there. */
   connectTimeoutMs: number;
   /** Backoff parameters — architecture §5.2. */
@@ -61,7 +63,17 @@ interface Runtime {
   sock: WASocket | undefined;
   auth: AtomicAuthState | undefined;
   state: InstanceStateValue;
+  /** QR rounds offered on the CURRENT socket. Reset by every #startInner. */
   qrRound: number;
+  /**
+   * QR rounds offered across this whole pairing session.
+   *
+   * Deliberately NOT reset by #startInner, because the restart it performs
+   * after WhatsApp's 428 is part of the same pairing attempt. Only an operator
+   * asking to pair again — start() — clears it. Without that distinction the
+   * restart resets its own budget and the gateway offers codes forever.
+   */
+  pairingRounds: number;
   phoneE164: string | null;
   connectedAt: string | null;
   disconnectedAt: string | null;
@@ -82,6 +94,7 @@ function newRuntime(reconnect: ReconnectScheduler): Runtime {
     auth: undefined,
     state: InstanceState.NEVER_CONNECTED,
     qrRound: 0,
+    pairingRounds: 0,
     phoneE164: null,
     connectedAt: null,
     disconnectedAt: null,
@@ -198,6 +211,13 @@ export class BaileysConnector implements WhatsAppConnector {
     // Cancel any armed backoff. Without this an operator's immediate reconnect
     // would race the scheduled one and open two sockets for one instance.
     runtime.reconnect.reset();
+
+    // A fresh pairing budget, for the same reason the reconnect budget is
+    // reset here and not in #startInner: somebody is asking to pair again, and
+    // `qr_timeout` exists precisely so that ask means something. The internal
+    // restart after WhatsApp's 428 goes through #startInner and must NOT land
+    // here, or the budget it is bounded by resets on every round.
+    runtime.pairingRounds = 0;
 
     // Two callers can reach this at once — a restore sweep and an API
     // reconnect, say. Without this the second would build a second socket for
@@ -397,6 +417,7 @@ export class BaileysConnector implements WhatsAppConnector {
       this.#clearWatchdog(runtime);
       runtime.state = InstanceState.CONNECTED;
       runtime.qrRound = 0;
+      runtime.pairingRounds = 0;
       // A successful connection is what "recovered" means, so the budget is
       // restored. Otherwise an instance that flapped nine times over a month
       // would give up on its tenth ever disconnect.
@@ -447,6 +468,7 @@ export class BaileysConnector implements WhatsAppConnector {
     this.#clearWatchdog(runtime);
 
     runtime.qrRound += 1;
+    runtime.pairingRounds += 1;
     const log = operationLogger({
       instance_id: instanceId,
       tenant_id: tenantId,
@@ -454,8 +476,20 @@ export class BaileysConnector implements WhatsAppConnector {
     });
 
     // An abandoned pairing modal must not leave a socket open indefinitely.
-    if (runtime.qrRound > this.#deps.qrMaxRounds) {
-      log.info({ status: 'ok', rounds: runtime.qrRound }, 'qr_rounds_exhausted');
+    //
+    // Two bounds, because there are two ways to overstay. qrMaxRounds catches
+    // one socket that keeps being offered codes; pairingMaxRounds catches a
+    // pairing session that keeps opening fresh sockets after each of
+    // WhatsApp's 428s — which is the one that actually binds, since WhatsApp
+    // closes an unscanned socket at around round four either way.
+    if (
+      runtime.qrRound > this.#deps.qrMaxRounds ||
+      runtime.pairingRounds > this.#deps.pairingMaxRounds
+    ) {
+      log.info(
+        { status: 'ok', rounds: runtime.qrRound, pairing_rounds: runtime.pairingRounds },
+        'qr_rounds_exhausted',
+      );
       runtime.state = InstanceState.QR_TIMEOUT;
       runtime.lastErrorCode = 'qr_timeout';
       await this.#deps.qr.clear(instanceId);
@@ -550,6 +584,71 @@ export class BaileysConnector implements WhatsAppConnector {
         willRetry: false,
         nextRetryAt: null,
       });
+      return;
+    }
+
+    // ── A pairing QR that expired is not a connection that failed ───────────
+    //
+    // WhatsApp closes an unscanned pairing socket with 428 after about four QR
+    // rounds. classifyDisconnect() can only see the status code, so it calls
+    // that 'retry' — correct for a PAIRED instance whose link is flapping, and
+    // wrong here in a way that made pairing impossible in production:
+    //
+    // Every unscanned round burned one reconnect attempt, so the gap between
+    // one QR disappearing and the next appearing grew exponentially —
+    // 0.5s, 3s, 6s, … up to WA_RECONNECT_MAX_MS (five minutes). Production
+    // logs caught it mid-climb: `attempt: 10, delay_ms: 86680`, an 87-second
+    // window in which Redis held no QR at all and GET /qr correctly answered
+    // 410 to every poll. Ten attempts later came `reconnect_attempts_exhausted`
+    // and `failed`, after which no code was ever offered again. On screen that
+    // is a pairing dialog stuck on "Waiting for a code…" — which is exactly
+    // what a studio reported, on an instance whose backoff had been climbing
+    // for hours.
+    //
+    // WhatsApp Web answers the same 428 by simply showing a fresh code, and so
+    // does this: reopen at once, no backoff. `pairingRounds` is what keeps that
+    // honest — it survives the restart (see the Runtime field), so the session
+    // still stops at WA_PAIRING_MAX_ROUNDS instead of offering codes forever.
+    //
+    // The test is "was this socket being offered a QR, having never connected"
+    // rather than "is connectedAt null": a previously-paired instance restored
+    // after a gateway restart also has a null connectedAt, and a 428 on THAT
+    // is the flapping case backoff exists for. WhatsApp only emits `qr` when
+    // it is not logged in and is waiting for a scan, so qrRound > 0 says
+    // pairing with no ambiguity.
+    const wasPairing = runtime.qrRound > 0 && runtime.connectedAt === null;
+
+    if (wasPairing) {
+      if (runtime.pairingRounds >= this.#deps.pairingMaxRounds) {
+        // Budget spent. `qr_timeout` is the honest terminal state and the one
+        // registry.reconnect() is documented to recover from — and start()
+        // clears pairingRounds, so pressing Connect really does start over.
+        runtime.state = InstanceState.QR_TIMEOUT;
+        runtime.lastErrorCode = 'qr_timeout';
+        log.info(
+          { status: 'ok', pairing_rounds: runtime.pairingRounds },
+          'pairing_rounds_exhausted',
+        );
+        await this.#emitDisconnected(instanceId, tenantId, 'qr_timeout', {
+          willRetry: false,
+          nextRetryAt: null,
+        });
+        return;
+      }
+
+      log.info(
+        { status: 'ok', pairing_rounds: runtime.pairingRounds },
+        'pairing_qr_session_expired — reopening for a fresh code',
+      );
+      // #startInner, NOT start(): the public entry point resets the pairing
+      // budget, which is right for an operator asking again and wrong here for
+      // the same reason the backoff loop avoids it.
+      //
+      // No event is emitted. This is one step inside a pairing the ERP already
+      // knows is in progress, and reporting it as a disconnect would flicker
+      // the card behind the dialog between `connecting` and `disconnected`
+      // every minute — the same reasoning as the 515 restart above.
+      await this.#startInner(instanceId, runtime);
       return;
     }
 
