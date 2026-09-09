@@ -16,6 +16,7 @@ import { operationLogger } from '../logger.js';
 import type { Manifest } from '../store/manifest.js';
 import type { QrReader } from '../store/qr.js';
 import type { EventSink } from '../events/outbox.js';
+import type { SendLedger } from '../store/sendLedger.js';
 import { EventType } from '../events/schema.js';
 import { assertUuid } from '../store/paths.js';
 import {
@@ -31,7 +32,28 @@ export interface RegistryDeps {
   connector: WhatsAppConnector;
   qr: QrReader;
   outbox: EventSink;
+  sendLedger: SendLedger;
   maxInstances: number;
+}
+
+/** One outbound message, as the ERP asks for it. */
+export interface OutboundMessage {
+  /** E.164, with or without the leading '+'. */
+  to: string;
+  text: string;
+  /**
+   * The ERP's id for this message, stable across ITS retries.
+   *
+   * This is the whole basis of send-once: it must identify the logical
+   * message, not the attempt. communication_logs.id is the natural value.
+   */
+  client_message_id: string;
+}
+
+export interface SendResult {
+  provider_message_id: string;
+  /** True when this was a replay and the original send's id is being returned. */
+  duplicate: boolean;
 }
 
 export class InstanceRegistry {
@@ -39,6 +61,7 @@ export class InstanceRegistry {
   readonly #connector: WhatsAppConnector;
   readonly #qr: QrReader;
   readonly #outbox: EventSink;
+  readonly #sendLedger: SendLedger;
   readonly #maxInstances: number;
 
   constructor(deps: RegistryDeps) {
@@ -46,6 +69,7 @@ export class InstanceRegistry {
     this.#connector = deps.connector;
     this.#qr = deps.qr;
     this.#outbox = deps.outbox;
+    this.#sendLedger = deps.sendLedger;
     this.#maxInstances = deps.maxInstances;
   }
 
@@ -185,6 +209,112 @@ export class InstanceRegistry {
     const stored = await this.#qr.get(record.instance_id);
     if (!stored) throw GatewayError.qrExpired();
     return stored;
+  }
+
+  /**
+   * Send one message on an instance this organization owns.
+   *
+   * ── Why this is on the registry and not the connector ─────────────────────
+   *
+   * Because it is the tenant boundary. `#requireOwned` is the private method
+   * every public operation passes through, and sending is the operation where
+   * getting it wrong is worst: a message delivered from the wrong studio's
+   * WhatsApp number cannot be recalled, and the recipient sees a stranger's
+   * business name. So the ownership check happens here, before the connector
+   * is handed anything, exactly as it does for qr, reconnect and remove.
+   *
+   * The order below is deliberate throughout:
+   *
+   *   1. own it, 2. is it connected, 3. claim the id, 4. send, 5. record.
+   *
+   * Claiming before sending is what makes a retry safe (see sendLedger.ts).
+   * Recording after is what makes the NEXT retry return the original id
+   * instead of sending again. A failure releases the claim, because a message
+   * that never left must stay retryable.
+   */
+  async sendMessage(
+    instanceId: string,
+    organizationId: string,
+    message: OutboundMessage,
+  ): Promise<SendResult> {
+    const record = this.#requireOwned(instanceId, organizationId);
+    const state = this.#connector.stateOf(record.instance_id);
+
+    if (state !== InstanceState.CONNECTED) {
+      // No event is emitted here. This is not a delivery failure — nothing was
+      // attempted — and the ERP already knows the instance state from the
+      // connection events. Emitting a `message.failed` would put a row in
+      // communication_logs for a send that never started.
+      throw GatewayError.notConnected(state);
+    }
+
+    const claim = await this.#sendLedger.claim(record.instance_id, message.client_message_id);
+    if (!claim.fresh) {
+      // Already sent under this id: hand back the ORIGINAL provider id so the
+      // caller's row still correlates with the receipts WhatsApp will send.
+      if (claim.provider_message_id) {
+        return { provider_message_id: claim.provider_message_id, duplicate: true };
+      }
+      // Still in flight. Refused rather than waited on: two callers racing one
+      // logical message is a bug worth surfacing, and blocking here would tie
+      // up a connection for however long the other send takes.
+      throw GatewayError.duplicateMessage(message.client_message_id);
+    }
+
+    const log = operationLogger({
+      instance_id: record.instance_id,
+      tenant_id: record.organization_id,
+      operation: 'registry.send',
+    });
+
+    let result: { provider_message_id: string };
+    try {
+      result = await this.#connector.sendText(record.instance_id, message.to, message.text);
+    } catch (err) {
+      await this.#sendLedger.release(record.instance_id, message.client_message_id);
+
+      const reasonCode = 'send_failed';
+      await this.#outbox.enqueue(EventType.MESSAGE_FAILED, {
+        instanceId: record.instance_id,
+        tenantId: record.organization_id,
+        payload: {
+          client_message_id: message.client_message_id,
+          reason_code: reasonCode,
+          // The ERP decides; this is advice. A send that threw against a
+          // connected socket is a transport blip far more often than a
+          // permanent refusal, and the ERP's attempt budget bounds it either
+          // way.
+          will_retry: true,
+        },
+      });
+
+      log.error({ status: 'error', err: (err as Error).message }, 'message_send_failed');
+      throw GatewayError.internal('Could not send the message.', {
+        client_message_id: message.client_message_id,
+      });
+    }
+
+    await this.#sendLedger.record(
+      record.instance_id,
+      message.client_message_id,
+      result.provider_message_id,
+    );
+
+    await this.#outbox.enqueue(EventType.MESSAGE_SENT, {
+      instanceId: record.instance_id,
+      tenantId: record.organization_id,
+      payload: {
+        client_message_id: message.client_message_id,
+        provider_message_id: result.provider_message_id,
+        sent_at: new Date().toISOString(),
+      },
+    });
+
+    log.info(
+      { status: 'ok', provider_message_id: result.provider_message_id },
+      'message_sent',
+    );
+    return { provider_message_id: result.provider_message_id, duplicate: false };
   }
 
   /**

@@ -44,6 +44,23 @@ export class NullConnector implements WhatsAppConnector {
     return Promise.resolve();
   }
 
+  /**
+   * Always rejects, and that is the honest answer.
+   *
+   * This connector never reports `connected`, so the registry refuses the send
+   * before it reaches here — but an implementation of the port that silently
+   * resolved with a fabricated message id would let a deployment configured
+   * with WA_CONNECTOR=null record messages as sent that were never sent at
+   * all, which is the one failure this file exists to avoid.
+   */
+  sendText(instanceId: string): Promise<{ provider_message_id: string }> {
+    operationLogger({ instance_id: instanceId, operation: 'connector.send' }).warn(
+      { status: 'error', reason: 'no_connector' },
+      'whatsapp_connector_not_implemented — sending is unavailable',
+    );
+    return Promise.reject(new Error('No WhatsApp connector is configured.'));
+  }
+
   stateOf(instanceId: string): InstanceStateValue {
     return this.#states.get(instanceId) ?? InstanceState.NEVER_CONNECTED;
   }

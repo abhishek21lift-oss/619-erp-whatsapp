@@ -5,6 +5,7 @@ import { loadConfig, setConfigForTesting } from './config.js';
 import { getLogger } from './logger.js';
 import { buildApp } from './app.js';
 import { createRedis } from './store/redis.js';
+import { RedisSendLedger } from './store/sendLedger.js';
 import { QrStore } from './store/qr.js';
 import { Manifest } from './store/manifest.js';
 import { Outbox } from './events/outbox.js';
@@ -65,6 +66,7 @@ async function main(): Promise<void> {
 
   const outbox = new Outbox(redis.client);
   const qr = new QrStore(redis.client, config.WA_QR_TTL_SEC);
+  const sendLedger = new RedisSendLedger(redis.client, config.WA_SEND_DEDUPE_TTL_SEC);
 
   // The manifest is the single source of instance ownership, so the connector
   // asks it rather than keeping a second copy that could drift from the
@@ -94,6 +96,7 @@ async function main(): Promise<void> {
     connector,
     qr,
     outbox,
+    sendLedger,
     maxInstances: config.WA_MAX_INSTANCES,
   });
 

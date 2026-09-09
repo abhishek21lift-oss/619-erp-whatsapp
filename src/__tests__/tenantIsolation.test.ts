@@ -2,8 +2,10 @@
 //
 // The brief's requirement is absolute: Studio A must never be able to access
 // Studio B's instance, read its messages, send through its number, or reach its
-// session credentials. This suite covers the first, third and fourth of those
-// for every route that exists; messages do not exist yet (Phase 9+).
+// session credentials. This suite covers every route that exists, sending
+// included — see outboundMessages.test.ts for the send path in depth, and the
+// mutation list below for the one assertion that has to live here: that a
+// refused cross-tenant call changes NOTHING, whatever it was asking for.
 //
 // Every assertion here is deliberately about the RESPONSE CODE as well as the
 // body. A 403 would leak the existence of another tenant's instance, and since
@@ -50,10 +52,22 @@ describe('cross-tenant isolation', () => {
       { method: 'POST' as const, url: `/v1/instances/${instanceA}/reconnect` },
       { method: 'POST' as const, url: `/v1/instances/${instanceA}/disconnect` },
       { method: 'DELETE' as const, url: `/v1/instances/${instanceA}` },
+      // Sending is the mutation where a leak is irreversible: the message
+      // arrives from A's WhatsApp number showing A's business name.
+      {
+        method: 'POST' as const,
+        url: `/v1/instances/${instanceA}/messages`,
+        payload: { to: '+919876543210', text: 'hi', client_message_id: 'x-tenant' },
+      },
     ];
 
-    for (const { method, url } of mutations) {
-      const res = await h.app.inject({ method, url, headers: authHeaders(ORG_B) });
+    for (const { method, url, payload } of mutations) {
+      const res = await h.app.inject({
+        method,
+        url,
+        headers: authHeaders(ORG_B),
+        ...(payload ? { payload } : {}),
+      });
       expect(res.statusCode, `${method} ${url}`).toBe(404);
     }
 

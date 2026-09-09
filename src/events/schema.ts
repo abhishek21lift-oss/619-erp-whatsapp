@@ -17,6 +17,22 @@ export const EventType = {
   INSTANCE_DISCONNECTED: 'whatsapp.instance.disconnected',
   INSTANCE_LOGGED_OUT: 'whatsapp.instance.logged_out',
   INSTANCE_DELETED: 'whatsapp.instance.deleted',
+
+  // ── Message lifecycle ─────────────────────────────────────────────────────
+  //
+  // The delivery callbacks the ERP's communication_logs is shaped for: its
+  // status vocabulary is already 'queued','sent','delivered','read','failed'
+  // and it already carries external_id for the provider's message id.
+  //
+  // These are keyed by provider_message_id rather than by the caller's
+  // client_message_id, because WhatsApp's own receipts arrive that way and
+  // holding a mapping here would be a second source of truth that outlives
+  // this process badly. The ERP matches on communication_logs.external_id,
+  // which it wrote when it received `sent`.
+  MESSAGE_SENT: 'whatsapp.message.sent',
+  MESSAGE_DELIVERED: 'whatsapp.message.delivered',
+  MESSAGE_READ: 'whatsapp.message.read',
+  MESSAGE_FAILED: 'whatsapp.message.failed',
 } as const;
 
 export type EventTypeValue = (typeof EventType)[keyof typeof EventType];
@@ -59,6 +75,37 @@ export interface EventPayloads {
   };
   [EventType.INSTANCE_LOGGED_OUT]: { reason_code: string | null };
   [EventType.INSTANCE_DELETED]: Record<string, never>;
+
+  /**
+   * Handed to WhatsApp and acknowledged by it.
+   *
+   * `sent` is not `delivered` — WhatsApp accepted the message, the recipient's
+   * device has not necessarily seen it. The ERP records both separately for
+   * that reason.
+   *
+   * No message BODY, here or in any of the four. The text is already in
+   * communication_logs on the ERP side; copying it into an event would put a
+   * studio's client correspondence into this service's outbox, its retry ZSET
+   * and the backend's request logs, none of which is a place it belongs.
+   */
+  [EventType.MESSAGE_SENT]: {
+    client_message_id: string;
+    provider_message_id: string;
+    sent_at: string;
+  };
+  [EventType.MESSAGE_DELIVERED]: { provider_message_id: string; delivered_at: string };
+  [EventType.MESSAGE_READ]: { provider_message_id: string; read_at: string };
+  /**
+   * `will_retry` is the gateway's advice, not its decision: this service does
+   * not queue outbound messages, so the retry belongs to the ERP's BullMQ job.
+   * The flag distinguishes a transport blip from a permanent refusal (an
+   * invalid number), which is the difference between retrying and not.
+   */
+  [EventType.MESSAGE_FAILED]: {
+    client_message_id: string;
+    reason_code: string;
+    will_retry: boolean;
+  };
 }
 
 export function buildEvent<T extends EventTypeValue>(

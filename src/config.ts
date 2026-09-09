@@ -136,6 +136,20 @@ export const configSchema = z.object({
 
   WA_QUARANTINE_RETENTION_DAYS: intFromEnv(7, 1, 90),
 
+  /**
+   * How long an outbound message's client_message_id is remembered.
+   *
+   * This is the window in which a repeat of the same logical message is
+   * recognised as a retry rather than sent again, so it must comfortably
+   * outlive the ERP's whole BullMQ ladder — three attempts with exponential
+   * backoff, plus however long a job waits for a worker. Six hours is far more
+   * than that and costs one small Redis key per message for the duration.
+   *
+   * Too SHORT is the dangerous direction: a retry arriving after expiry looks
+   * like a first attempt and the client gets the message twice.
+   */
+  WA_SEND_DEDUPE_TTL_SEC: intFromEnv(6 * 3600, 60, 7 * 24 * 3600),
+
   // Per-instance API rate limit (architecture §18). Guards against a backend
   // bug — a runaway poll loop — not against an attacker, who cannot reach this
   // service at all.

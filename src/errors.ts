@@ -10,6 +10,19 @@ export const ErrorCode = {
   UNAUTHORIZED: 'UNAUTHORIZED',
   INSTANCE_NOT_FOUND: 'INSTANCE_NOT_FOUND',
   INSTANCE_CONFLICT: 'INSTANCE_CONFLICT',
+  /**
+   * The instance exists and belongs to the caller, but there is no live
+   * WhatsApp socket to send on.
+   *
+   * Deliberately its own code rather than an INSTANCE_CONFLICT. The backend has
+   * to tell "your studio has not connected WhatsApp / it dropped" — which is
+   * retryable and a thing the studio can fix — apart from "you asked to pair
+   * something already paired", which is neither. One code for both would make
+   * the retry decision unmakeable.
+   */
+  INSTANCE_NOT_CONNECTED: 'INSTANCE_NOT_CONNECTED',
+  /** A send whose client_message_id is already in flight on this instance. */
+  DUPLICATE_MESSAGE: 'DUPLICATE_MESSAGE',
   QR_EXPIRED: 'QR_EXPIRED',
   RATE_LIMITED: 'RATE_LIMITED',
   CAPACITY_REACHED: 'CAPACITY_REACHED',
@@ -66,6 +79,37 @@ export class GatewayError extends Error {
 
   static conflict(message: string, context?: Record<string, unknown>): GatewayError {
     return new GatewayError(ErrorCode.INSTANCE_CONFLICT, 409, message, context);
+  }
+
+  /**
+   * 409 rather than 503: the gateway is perfectly healthy, this studio's
+   * WhatsApp is not. A 503 would tell the caller to retry against the service,
+   * and no amount of retrying reconnects a socket only the studio can restore
+   * by scanning a QR.
+   */
+  static notConnected(state: string): GatewayError {
+    return new GatewayError(
+      ErrorCode.INSTANCE_NOT_CONNECTED,
+      409,
+      'WhatsApp is not connected for this instance.',
+      { state },
+    );
+  }
+
+  /**
+   * A send already in flight under the same client_message_id.
+   *
+   * 409 and not an error the caller should paper over: it means two deliveries
+   * of one logical message raced. Answering "fine" would be a lie about which
+   * of them reached the client.
+   */
+  static duplicateMessage(clientMessageId: string): GatewayError {
+    return new GatewayError(
+      ErrorCode.DUPLICATE_MESSAGE,
+      409,
+      'A message with this client_message_id is already being sent.',
+      { client_message_id: clientMessageId },
+    );
   }
 
   static qrExpired(): GatewayError {
