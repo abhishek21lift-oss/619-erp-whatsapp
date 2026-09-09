@@ -112,6 +112,23 @@ export interface WhatsAppConnector {
   /** Close the socket, KEEPING credentials. Idempotent. */
   stop(instanceId: string): Promise<void>;
 
+  /**
+   * Send one text message on this instance's live socket.
+   *
+   * Throws when there is no connected socket. It does NOT queue, retry, or
+   * decide whether a failure is worth retrying — the ERP's BullMQ job owns all
+   * three, and a second retry policy here would compound with that one into a
+   * delivery count nobody can reason about.
+   *
+   * `to` is an E.164 number without the leading `+`; the JID is built by the
+   * implementation so the wire format stays a Baileys detail.
+   */
+  sendText(
+    instanceId: string,
+    to: string,
+    text: string,
+  ): Promise<{ provider_message_id: string }>;
+
   /** Close the socket and DESTROY credentials. Idempotent. */
   logout(instanceId: string): Promise<void>;
 

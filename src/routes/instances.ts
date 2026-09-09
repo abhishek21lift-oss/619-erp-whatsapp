@@ -36,6 +36,27 @@ const instanceParams = z.object({ id: uuid });
 const listQuery = z.object({ organization_id: uuid.optional() });
 
 /**
+ * One outbound message.
+ *
+ * `to` is E.164 digits with an optional leading '+'. Validated here rather
+ * than left to Baileys because a malformed number reaching `toJid` becomes a
+ * JID for a different (or nonexistent) person rather than an error — the digit
+ * strip would quietly turn "not a number" into "some number".
+ *
+ * The 4096-character body cap is WhatsApp's own text limit. Enforcing it here
+ * turns a silent truncation deep in the protocol into a 400 the ERP can show
+ * a studio while they are still writing the template.
+ */
+const sendBody = z.object({
+  to: z
+    .string()
+    .trim()
+    .regex(/^\+?[1-9]\d{7,14}$/, 'to must be an E.164 phone number, e.g. +919999999999'),
+  text: z.string().min(1, 'text must not be empty').max(4096),
+  client_message_id: z.string().min(1).max(128),
+});
+
+/**
  * The organization this request acts for.
  *
  * Mandatory on every instance-scoped route. A missing header is a 400 rather
@@ -127,6 +148,32 @@ export function registerInstanceRoutes(
   app.get('/v1/instances/:id/qr', async (request) => {
     const { id } = parse(instanceParams, request.params, 'params');
     return registry.qr(id, orgOf(request.headers as Record<string, unknown>));
+  });
+
+  // POST /v1/instances/:id/messages — send one message.
+  //
+  // ── Why this is instance-scoped rather than organization-scoped ───────────
+  //
+  // `POST /v1/messages` with an organization would make the ORGANIZATION the
+  // lookup key, and §6.2's whole rule is that it never is. Addressing the
+  // instance and checking the owner second keeps sending on exactly the same
+  // footing as every other operation here: a wrong organization cannot select
+  // a different studio's WhatsApp, it can only fail.
+  //
+  // 200, not 202: unlike reconnect, this is synchronous. The response carries
+  // the provider's message id, which the ERP needs in order to correlate the
+  // delivery receipts that follow. A 202 would leave it with a row it cannot
+  // match a receipt to.
+  app.post('/v1/instances/:id/messages', async (request) => {
+    const { id } = parse(instanceParams, request.params, 'params');
+    const body = parse(sendBody, request.body, 'body');
+    const org = orgOf(request.headers as Record<string, unknown>);
+
+    return registry.sendMessage(id, org, {
+      to: body.to,
+      text: body.text,
+      client_message_id: body.client_message_id,
+    });
   });
 
   // 202, not 200: reconnection is asynchronous. The instance is `connecting`

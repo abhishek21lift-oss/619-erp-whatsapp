@@ -125,6 +125,52 @@ export function extractPhoneE164(user: { id?: string; phoneNumber?: string } | u
   return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
 }
 
+/**
+ * WhatsApp's own ack levels, from Baileys' WAMessageStatus enum.
+ *
+ * Written out rather than imported because they are a WIRE contract we only
+ * read, and the enum's name has moved between Baileys majors while the numbers
+ * have not. Pinning the numbers keeps a Baileys upgrade from silently changing
+ * which receipts become which events.
+ */
+const WA_STATUS_DELIVERED = 3;
+const WA_STATUS_READ = 4;
+const WA_STATUS_PLAYED = 5;
+
+/**
+ * Which delivery event a WhatsApp ack level becomes, if any.
+ *
+ * Pure and exported so the mapping is testable without a socket — the receipt
+ * handler around it needs a live Baileys connection, and the thing most likely
+ * to be wrong is this table.
+ *
+ * Anything below DELIVERY_ACK returns null deliberately. Level 2 is "the
+ * server has it", which is the same fact `message.sent` already recorded, and
+ * re-reporting it would move a row BACKWARDS in the ERP's status ladder if it
+ * arrived after a delivery receipt — WhatsApp does not guarantee these arrive
+ * in order.
+ */
+export function receiptEventFor(
+  status: number | null | undefined,
+): typeof EventType.MESSAGE_DELIVERED | typeof EventType.MESSAGE_READ | null {
+  if (status === WA_STATUS_DELIVERED) return EventType.MESSAGE_DELIVERED;
+  if (status === WA_STATUS_READ || status === WA_STATUS_PLAYED) return EventType.MESSAGE_READ;
+  return null;
+}
+
+/**
+ * E.164 digits → the individual-chat JID Baileys addresses.
+ *
+ * Non-digits are stripped so a stored `+91 99999 99999` and `+919999999999`
+ * reach the same person. Group JIDs (`@g.us`) are deliberately unreachable
+ * from here: this gateway sends to clients, and a bug that broadcast a
+ * studio's automation into a group chat would be unrecoverable.
+ */
+export function toJid(e164: string): string {
+  const digits = String(e164).replace(/\D/g, '');
+  return `${digits}@s.whatsapp.net`;
+}
+
 export class BaileysConnector implements WhatsAppConnector {
   readonly #deps: BaileysConnectorDeps;
   readonly #runtimes = new Map<string, Runtime>();
@@ -332,6 +378,16 @@ export class BaileysConnector implements WhatsAppConnector {
     sock.ev.on('connection.update', (update) => {
       void this.#onConnectionUpdate(instanceId, runtime, update).catch((err: Error) => {
         log.error({ err: err.message, status: 'error' }, 'connection_update_handler_failed');
+      });
+    });
+
+    // WhatsApp's own receipts for messages WE sent. This is the only place a
+    // real `delivered` can come from — `sent` means WhatsApp accepted it, not
+    // that the recipient's phone has it — and the ERP's communication_logs has
+    // separate delivered_at and read_at columns waiting for exactly this.
+    sock.ev.on('messages.update', (updates) => {
+      void this.#onMessageReceipts(instanceId, updates).catch((err: Error) => {
+        log.error({ err: err.message, status: 'error' }, 'message_receipt_handler_failed');
       });
     });
 
@@ -724,6 +780,101 @@ export class BaileysConnector implements WhatsAppConnector {
       getLogger().error({ err: (err as Error).message }, 'creds_clear_failed');
     }
     runtime.auth = undefined;
+  }
+
+  // ── Outbound messages ──────────────────────────────────────────────────────
+
+  /**
+   * Send one text message.
+   *
+   * Two things this deliberately does not do. It does not retry: the ERP's
+   * BullMQ job owns the retry policy, and a second one here would multiply
+   * with it into a delivery count nobody can reason about. And it does not
+   * check tenant ownership — the registry does that before calling, through
+   * `#requireOwned`, which is the one place ownership is decided.
+   *
+   * `to` arrives as E.164 digits. The JID suffix is applied here so the wire
+   * format stays a Baileys detail: the ERP stores phone numbers, not JIDs, and
+   * a future provider would want the number rather than this encoding.
+   */
+  async sendText(
+    instanceId: string,
+    to: string,
+    text: string,
+  ): Promise<{ provider_message_id: string }> {
+    const runtime = this.#runtime(instanceId);
+    const sock = runtime.sock;
+
+    // Both halves matter. A socket can exist while the connection is down —
+    // that is precisely the `reconnecting` window — and sending into it
+    // resolves with a message id for a message that never left.
+    if (!sock || runtime.state !== InstanceState.CONNECTED) {
+      throw new Error(`Instance is not connected (state: ${runtime.state}).`);
+    }
+
+    const result = await sock.sendMessage(toJid(to), { text });
+    const providerMessageId = result?.key?.id;
+    if (!providerMessageId) {
+      // Baileys resolved without an id. Treating that as success would record
+      // a message as sent with nothing to correlate a receipt against, so it
+      // is a failure here rather than an untraceable row there.
+      throw new Error('WhatsApp accepted the message but returned no message id.');
+    }
+
+    operationLogger({
+      instance_id: instanceId,
+      tenant_id: this.#deps.resolveTenant(instanceId),
+      operation: 'connector.send',
+    }).info({ status: 'ok', provider_message_id: providerMessageId }, 'message_sent');
+
+    return { provider_message_id: providerMessageId };
+  }
+
+  /**
+   * Turn WhatsApp's ack levels into delivery events.
+   *
+   * `fromMe` is the filter that matters: `messages.update` also carries
+   * receipts for messages the STUDIO's phone sent by hand and for inbound
+   * ones, and emitting those would produce delivery events for message ids the
+   * ERP has never heard of — noise its webhook would have to learn to ignore.
+   *
+   * Statuses below DELIVERY_ACK are dropped rather than mapped. Baileys 2 is
+   * "server ack", which is the same fact `sent` already recorded, and emitting
+   * it again would move a row backwards in the ERP's status ladder if it
+   * arrived after a delivery receipt.
+   */
+  async #onMessageReceipts(
+    instanceId: string,
+    updates: { key: { id?: string | null; fromMe?: boolean | null }; update: { status?: number | null } }[],
+  ): Promise<void> {
+    const tenantId = this.#deps.resolveTenant(instanceId);
+    // An instance removed mid-flight. An event with no tenant is unroutable,
+    // and the same rule the connection events follow.
+    if (!tenantId) return;
+
+    for (const entry of updates) {
+      if (!entry.key?.fromMe) continue;
+      const providerMessageId = entry.key.id;
+      if (!providerMessageId) continue;
+
+      const eventType = receiptEventFor(entry.update?.status);
+      if (!eventType) continue;
+
+      const at = new Date().toISOString();
+      if (eventType === EventType.MESSAGE_DELIVERED) {
+        await this.#deps.outbox.enqueue(eventType, {
+          instanceId,
+          tenantId,
+          payload: { provider_message_id: providerMessageId, delivered_at: at },
+        });
+      } else {
+        await this.#deps.outbox.enqueue(eventType, {
+          instanceId,
+          tenantId,
+          payload: { provider_message_id: providerMessageId, read_at: at },
+        });
+      }
+    }
   }
 
   /**

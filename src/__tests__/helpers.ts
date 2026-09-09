@@ -20,6 +20,7 @@ import { InstanceRegistry } from '../domain/registry.js';
 import { InstanceState, type InstanceStateValue, type WhatsAppConnector } from '../domain/instance.js';
 import type { QrReader, StoredQr } from '../store/qr.js';
 import type { EventSink } from '../events/outbox.js';
+import type { SendLedger, SendClaim } from '../store/sendLedger.js';
 import type { GatewayEvent, EventTypeValue, EventPayloads } from '../events/schema.js';
 import { buildEvent } from '../events/schema.js';
 import type { RedisHandle } from '../store/redis.js';
@@ -80,6 +81,30 @@ export class FakeConnector implements WhatsAppConnector {
     return Promise.resolve();
   }
 
+  /** Every send this connector was asked to make, in order. */
+  readonly sent: { instanceId: string; to: string; text: string }[] = [];
+  /** Set to make the next sendText throw, for the failure-event path. */
+  failNextSend: string | null = null;
+  #messageSeq = 0;
+
+  sendText(instanceId: string, to: string, text: string): Promise<{ provider_message_id: string }> {
+    this.calls.push(`send:${instanceId}`);
+    if (this.failNextSend) {
+      const reason = this.failNextSend;
+      this.failNextSend = null;
+      return Promise.reject(new Error(reason));
+    }
+    // Mirrors the real connector's refusal rather than trusting the registry
+    // to have checked: a test that passes only because the fake is permissive
+    // proves nothing about the guard.
+    if (this.states.get(instanceId) !== InstanceState.CONNECTED) {
+      return Promise.reject(new Error(`Instance is not connected (state: ${this.stateOf(instanceId)}).`));
+    }
+    this.sent.push({ instanceId, to, text });
+    this.#messageSeq += 1;
+    return Promise.resolve({ provider_message_id: `WAMSG${this.#messageSeq}` });
+  }
+
   stateOf(instanceId: string): InstanceStateValue {
     return this.states.get(instanceId) ?? InstanceState.NEVER_CONNECTED;
   }
@@ -115,6 +140,42 @@ export class FakeQrStore implements QrReader {
 
   clear(instanceId: string): Promise<void> {
     this.values.delete(instanceId);
+    return Promise.resolve();
+  }
+}
+
+/**
+ * An in-memory stand-in for RedisSendLedger.
+ *
+ * Deliberately implements the real claim/record/release semantics rather than
+ * always answering "fresh": the send-once tests are about that state machine,
+ * and a permissive fake would let them pass against a registry that never
+ * consulted the ledger at all.
+ */
+export class FakeSendLedger implements SendLedger {
+  /** key → provider id, or null while a send is in flight. */
+  readonly entries = new Map<string, string | null>();
+
+  static #key(instanceId: string, clientMessageId: string): string {
+    return `${instanceId}:${clientMessageId}`;
+  }
+
+  claim(instanceId: string, clientMessageId: string): Promise<SendClaim> {
+    const key = FakeSendLedger.#key(instanceId, clientMessageId);
+    if (this.entries.has(key)) {
+      return Promise.resolve({ fresh: false, provider_message_id: this.entries.get(key) ?? null });
+    }
+    this.entries.set(key, null);
+    return Promise.resolve({ fresh: true, provider_message_id: null });
+  }
+
+  record(instanceId: string, clientMessageId: string, providerMessageId: string): Promise<void> {
+    this.entries.set(FakeSendLedger.#key(instanceId, clientMessageId), providerMessageId);
+    return Promise.resolve();
+  }
+
+  release(instanceId: string, clientMessageId: string): Promise<void> {
+    this.entries.delete(FakeSendLedger.#key(instanceId, clientMessageId));
     return Promise.resolve();
   }
 }
@@ -164,6 +225,7 @@ export interface Harness {
   connector: FakeConnector;
   qr: FakeQrStore;
   outbox: FakeOutbox;
+  sendLedger: FakeSendLedger;
   dir: string;
   cleanup(): Promise<void>;
 }
@@ -200,12 +262,14 @@ export async function buildHarness(
   const connector = new FakeConnector();
   const qr = new FakeQrStore();
   const outbox = new FakeOutbox();
+  const sendLedger = new FakeSendLedger();
 
   const registry = new InstanceRegistry({
     manifest,
     connector,
     qr,
     outbox,
+    sendLedger,
     maxInstances: config.WA_MAX_INSTANCES,
   });
 
@@ -224,6 +288,7 @@ export async function buildHarness(
     connector,
     qr,
     outbox,
+    sendLedger,
     dir,
     async cleanup() {
       await app.close();

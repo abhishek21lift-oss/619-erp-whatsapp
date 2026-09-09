@@ -1583,6 +1583,7 @@ Errors: `{ "error": { "code": "…", "message": "…" } }`.
 | `GET` | `/v1/instances/:id` | | `200 { instance }` |
 | `GET` | `/v1/instances/:id/qr` | | `200 { qr, expires_in_ms }` · `410 QR_EXPIRED` · `409` if connected |
 | `GET` | `/v1/instances/:id/status` | | `200 { state, phone_e164, connected_at, last_error_code }` |
+| `POST` | `/v1/instances/:id/messages` | `{ to: E.164, text, client_message_id }` — send one text | `200 { provider_message_id, duplicate }` · `409 INSTANCE_NOT_CONNECTED` · `409 DUPLICATE_MESSAGE` |
 | `POST` | `/v1/instances/:id/reconnect` | Resets the attempt counter | `202 { state: 'connecting' }` |
 | `POST` | `/v1/instances/:id/disconnect` | Closes the socket, **keeps** creds | `202 { state: 'disconnected' }` |
 | `DELETE` | `/v1/instances/:id` | Logs out, **destroys** creds | `204` |
@@ -1592,9 +1593,26 @@ Every instance-scoped route requires `X-Org-Id` and asserts ownership before
 doing anything (§2, §6.2). `disconnect` vs `DELETE` is a deliberate distinction:
 one is "pause, no rescan needed", the other is "unlink, rescan required".
 
+`POST …/messages` is **200, not 202**, unlike the other two mutations: it is
+synchronous, and the response carries the provider's message id that the ERP
+needs in order to match the delivery receipts which follow. A 202 would leave
+the backend holding a `communication_logs` row it could never correlate.
+
+`client_message_id` is the ERP's own id for the message and must be stable
+across ITS retries — `communication_logs.id` is the natural value. The gateway
+claims it in Redis before sending (`WA_SEND_DEDUPE_TTL_SEC`, default 6h) and
+records the provider id against it after, so a BullMQ retry of a job whose
+response was lost returns `{ duplicate: true }` with the ORIGINAL id instead of
+sending the studio's client the same message twice. A send that genuinely
+failed releases the claim, so it stays retryable.
+
+The gateway does **not** retry sends. The ERP's BullMQ job owns that policy,
+and a second one here would compound with it into a delivery count nobody can
+reason about.
+
 ### Post-MVP (defined, not built)
 
-`POST /v1/instances/:id/messages` · `POST …/media` · `GET …/chats` · `GET …/messages`
+`POST …/media` · `GET …/chats` · `GET …/messages`
 
 ### Backend surface (frontend-facing)
 
@@ -1651,7 +1669,29 @@ all 462 endpoints. It must be updated in the same commit, deliberately.
 | `whatsapp.instance.disconnected` | `{ reason_code, will_retry, next_retry_at }` |
 | `whatsapp.instance.logged_out` | `{ reason_code }` |
 | `whatsapp.instance.deleted` | `{}` |
-| `whatsapp.message.*` *(post-MVP)* | `{ message_id, direction, to_e164 \| from_e164, status, … }` |
+| `whatsapp.message.sent` | `{ client_message_id, provider_message_id, sent_at }` |
+| `whatsapp.message.delivered` | `{ provider_message_id, delivered_at }` |
+| `whatsapp.message.read` | `{ provider_message_id, read_at }` |
+| `whatsapp.message.failed` | `{ client_message_id, reason_code, will_retry }` |
+
+The three receipt events are keyed by `provider_message_id`, not by the ERP's
+`client_message_id`, because WhatsApp's own receipts arrive that way. The ERP
+matches on `communication_logs.external_id`, which it wrote when it received
+`sent`. Holding the mapping here instead would be a second source of truth that
+does not survive a restart.
+
+**No message body crosses this hop, in any of the four.** The text is already
+in `communication_logs`; copying it into an event would put a studio's client
+correspondence into the outbox, the retry ZSET and the backend's request
+logs — the same reasoning that keeps the QR string out of
+`whatsapp.instance.qr` (§8.3).
+
+`sent` is not `delivered`: `sent` means WhatsApp accepted the message,
+`delivered` means the recipient's device has it. `communication_logs` has
+separate `sent_at` and `delivered_at` columns for exactly that reason. Acks
+below WhatsApp's DELIVERY_ACK are dropped rather than mapped — its "server ack"
+restates what `sent` already recorded, and emitting it could move a row
+backwards in the status ladder, since receipts are not ordered.
 
 ---
 
