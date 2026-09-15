@@ -1,9 +1,27 @@
 name: Deploy WhatsApp Gateway to VPS
 
+# ── Gated on CI ─────────────────────────────────────────────────────────────
+#
+# This used to trigger on any push to the branch, with nothing checked first.
+# The gateway delivers every WhatsApp message the ERP sends, and a push with a
+# failing typecheck, a failing test or a build that emits nothing went straight
+# to the VPS. (The repository had no CI at all until the commit before this
+# one, so there was nothing it *could* have waited for.)
+#
+# Now it waits on CI's conclusion, the same way the backend's deploy.yml waits
+# on its own. The `branches` filter matches the HEAD BRANCH OF THE CI RUN, so
+# CI runs for pull requests — whose head branch is the PR's — do not reach
+# here; only a run on the deploy branch itself does.
 on:
-  push:
+  workflow_run:
+    workflows: ["CI — Lint · Type-check · Test · Build"]
+    types: [completed]
     branches:
       - feature/whatsapp-gateway-mvp
+  # Manual deploy, and the escape hatch. Two cases need it: a commit pushed
+  # with an app or bot token, which GitHub deliberately does not run `push`
+  # workflows for — so CI never runs, so this never fires — and a rollback that
+  # must go out without waiting for a fresh CI pass.
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +31,18 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # A completed CI run is not a passing one. Without this the deploy would
+    # fire on failure and cancellation too, which is the trigger it replaced.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
+      - name: Report what is being deployed and why it was allowed
+        run: |
+          echo "Trigger:    ${{ github.event_name }}"
+          echo "CI result:  ${{ github.event.workflow_run.conclusion || 'n/a (manual dispatch)' }}"
+          echo "Commit:     ${{ github.event.workflow_run.head_sha || github.sha }}"
+
       - name: Deploy gateway to MY PT STUDIO VPS
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -103,4 +132,4 @@ jobs:
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml ps whatsapp
             docker exec myptstudio-whatsapp node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1);return r.json()}).then(console.log)"
 
-            printf '%s\n' '${{ github.sha }}' > /opt/myptstudio/.whatsapp-deployed-sha
+            printf '%s\n' '${{ github.event.workflow_run.head_sha || github.sha }}' > /opt/myptstudio/.whatsapp-deployed-sha

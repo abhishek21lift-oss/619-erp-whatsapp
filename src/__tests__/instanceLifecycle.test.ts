@@ -147,11 +147,16 @@ describe('instance lifecycle', () => {
     await manifest.load();
     expect(manifest.list()).toHaveLength(3);
 
+    // The send ledger travels with the restored registry. A restored instance
+    // that could not claim a client_message_id would send duplicates after
+    // every restart — which is exactly the window this test covers — so the
+    // rebuild must carry the same dependency set boot does, not a subset.
     const fresh = new InstanceRegistry({
       manifest,
       connector: h.connector,
       qr: h.qr,
       outbox: h.outbox,
+      sendLedger: h.sendLedger,
       maxInstances: 50,
     });
 
