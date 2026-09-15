@@ -1,0 +1,136 @@
+name: CI — Lint · Type-check · Test · Build
+
+# ── Why this exists ─────────────────────────────────────────────────────────
+#
+# Until now this repository had exactly one workflow — deploy-vps.yml — and
+# nothing that ran lint, typecheck, tests or the build on a pull request. The
+# gateway is production-critical (it is what actually delivers every WhatsApp
+# message the ERP sends) and it was deploying to the VPS with none of its own
+# checks having been run.
+#
+# That is not hypothetical. `npm run typecheck` sat broken at 20 errors, and
+# among them was a lifecycle test constructing an InstanceRegistry without its
+# send ledger — the component that makes send-once work across a restart. The
+# repo's own tsconfig.check.json says why that matters: "A test that does not
+# typecheck is a test that is quietly asserting the wrong thing." Nothing was
+# collecting that guarantee, so nothing noticed.
+#
+# Job names and structure follow the backend's CI so the three repositories
+# read the same way in the checks list.
+
+on:
+  push:
+    branches: [feature/whatsapp-gateway-mvp]
+  pull_request:
+    branches: [feature/whatsapp-gateway-mvp]
+  # Manual re-run. Same reasoning as the backend's: GitHub does not fire
+  # `push` workflows for commits authenticated with an app or bot token, so
+  # such a commit would otherwise get no run at all.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Lint ────────────────────────────────────────────────────
+  lint:
+    name: ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        # Zero, not a budget. This repo has no warning backlog to absorb, so
+        # the ceiling starts where it should and a new warning fails the run
+        # rather than being quietly tolerated.
+        run: npm run lint -- --max-warnings=0
+
+  # ── Job 2: Type-check ──────────────────────────────────────────────
+  typecheck:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        # tsconfig.check.json, NOT tsconfig.json — the difference is that it
+        # includes src/__tests__. The build config excludes tests so they never
+        # reach the image; this config is the only thing that typechecks them,
+        # and it is the check that had been failing.
+        run: npm run typecheck
+
+  # ── Job 3: Unit tests ──────────────────────────────────────────────
+  test:
+    name: Vitest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  # ── Job 4: Build ───────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: The build produced something runnable
+        # `tsc` can exit 0 having emitted nothing if outDir or the include glob
+        # is wrong, and the failure would then surface as a container that
+        # cannot start. package.json's `main` is dist/server.js; assert it.
+        run: test -f dist/server.js
+
+  # ── Job 5: Dependency audit ────────────────────────────────────────
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Audit dependencies
+        # Clean at time of writing. When an advisory lands, prefer an
+        # `overrides` entry for a transitive dependency over loosening this.
+        run: npm audit --audit-level=high
