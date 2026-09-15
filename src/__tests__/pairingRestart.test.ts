@@ -111,6 +111,24 @@ async function waitForSockets(count: number, timeoutMs = 2_000): Promise<void> {
 }
 
 /**
+ * The nth fake socket, asserted to exist.
+ *
+ * `noUncheckedIndexedAccess` types `h.sockets[n]` as possibly undefined, and it
+ * genuinely is: every one of these reads follows a reopen that the connector
+ * performs asynchronously. Indexing straight through would have meant either a
+ * non-null assertion on each line — silencing precisely the case worth
+ * knowing about — or a cast. Failing loudly here names the missing socket
+ * instead of throwing "cannot read properties of undefined" from inside emit().
+ */
+function socket(index: number) {
+  const sock = h.sockets.at(index);
+  if (!sock) {
+    throw new Error(`expected a socket at index ${index}, saw ${h.sockets.length} in total`);
+  }
+  return sock;
+}
+
+/**
  * Give any pending async work a real chance to run, then stop.
  *
  * For the NEGATIVE assertions — "no socket was opened", "no event was sent" —
@@ -166,16 +184,16 @@ describe('an unscanned QR expiring is not a connection failure', () => {
     const connector = build();
     await connector.start(INSTANCE);
 
-    await h.sockets[0].emit({ qr: 'code-round-1' });
+    await socket(0).emit({ qr: 'code-round-1' });
     expect(qrWrites).toEqual(['code-round-1']);
 
-    await h.sockets[0].emit(CLOSE_428);
+    await socket(0).emit(CLOSE_428);
 
     // A second socket appears without any timer having to fire. Under the old
     // behaviour this never arrived — the reopen waited on the backoff clock.
     await waitForSockets(2);
 
-    await h.sockets[1].emit({ qr: 'code-round-2' });
+    await socket(1).emit({ qr: 'code-round-2' });
     await settle(20);
     expect(qrWrites).toEqual(['code-round-1', 'code-round-2']);
     expect(connector.stateOf(INSTANCE)).toBe(InstanceState.CONNECTING);
@@ -187,8 +205,8 @@ describe('an unscanned QR expiring is not a connection failure', () => {
     // written on a pairing that is proceeding normally.
     const connector = build();
     await connector.start(INSTANCE);
-    await h.sockets[0].emit({ qr: 'code' });
-    await h.sockets[0].emit(CLOSE_428);
+    await socket(0).emit({ qr: 'code' });
+    await socket(0).emit(CLOSE_428);
     await settle();
 
     expect(events).not.toContain('whatsapp.instance.disconnected');
@@ -202,7 +220,7 @@ describe('an unscanned QR expiring is not a connection failure', () => {
 
     for (let round = 1; round <= 5; round += 1) {
       await waitForSockets(round);
-      const sock = h.sockets[round - 1];
+      const sock = socket(round - 1);
       await sock.emit({ qr: `code-${round}` });
       await settle(20);
       await sock.emit(CLOSE_428);
@@ -226,7 +244,7 @@ describe('the pairing budget still bounds it', () => {
     await connector.start(INSTANCE);
 
     for (let round = 1; round <= 8; round += 1) {
-      const sock = h.sockets[h.sockets.length - 1];
+      const sock = socket(-1);
       await sock.emit({ qr: `code-${round}` });
       await settle(20);
       await sock.emit(CLOSE_428);
@@ -240,9 +258,9 @@ describe('the pairing budget still bounds it', () => {
   it('tells the ERP the truth when it gives up', async () => {
     const connector = build({ pairingMaxRounds: 1 });
     await connector.start(INSTANCE);
-    await h.sockets[0].emit({ qr: 'only-code' });
+    await socket(0).emit({ qr: 'only-code' });
     await settle(20);
-    await h.sockets[0].emit(CLOSE_428);
+    await socket(0).emit(CLOSE_428);
     await settle();
 
     expect(events).toContain('whatsapp.instance.disconnected');
@@ -255,14 +273,14 @@ describe('the pairing budget still bounds it', () => {
     // escape, so the two halves have to agree.
     const connector = build({ pairingMaxRounds: 1 });
     await connector.start(INSTANCE);
-    await h.sockets[0].emit({ qr: 'first' });
+    await socket(0).emit({ qr: 'first' });
     await settle(20);
-    await h.sockets[0].emit(CLOSE_428);
+    await socket(0).emit(CLOSE_428);
     await settle();
     expect(connector.stateOf(INSTANCE)).toBe(InstanceState.QR_TIMEOUT);
 
     await connector.start(INSTANCE);
-    const sock = h.sockets[h.sockets.length - 1];
+    const sock = socket(-1);
     await sock.emit({ qr: 'second' });
     await settle(20);
 
@@ -277,14 +295,14 @@ describe('a connection that really did fail still backs off', () => {
     // must NOT be reopened in a tight loop.
     const connector = build();
     await connector.start(INSTANCE);
-    await h.sockets[0].emit({ qr: 'code' });
+    await socket(0).emit({ qr: 'code' });
     await settle(20);
-    await h.sockets[0].emit({ connection: 'open' });
+    await socket(0).emit({ connection: 'open' });
     await settle(20);
     expect(connector.stateOf(INSTANCE)).toBe(InstanceState.CONNECTED);
 
     const socketsBefore = h.sockets.length;
-    await h.sockets[0].emit(CLOSE_428);
+    await socket(0).emit(CLOSE_428);
     await settle();
 
     // Backoff armed instead: no new socket, even given time to appear.
@@ -300,7 +318,7 @@ describe('a connection that really did fail still backs off', () => {
     await connector.start(INSTANCE);
 
     const socketsBefore = h.sockets.length;
-    await h.sockets[0].emit(CLOSE_428);
+    await socket(0).emit(CLOSE_428);
     await settle();
 
     expect(h.sockets).toHaveLength(socketsBefore);
