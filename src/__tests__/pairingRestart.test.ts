@@ -350,6 +350,12 @@ describe('the single-owner instance lock (architecture §11.3)', () => {
     expect(h.sockets).toHaveLength(0);
     expect(state).toBe(InstanceState.RECONNECTING);
     expect(events).toContain('whatsapp.instance.disconnected');
+
+    // Every test in this file shares `h.sockets`, and this one deliberately
+    // leaves a retry armed — without this, that timer fires during a LATER
+    // test and pushes a socket into the shared array there. (It did: CI
+    // caught it as "expected 0, got 2" two tests down.)
+    await connector.shutdown();
   });
 
   it('retries a held lock rather than parking in failed — the restart case, not a second container', async () => {
@@ -372,6 +378,8 @@ describe('the single-owner instance lock (architecture §11.3)', () => {
     // The dead process's lock expires; the armed retry now gets through.
     held = false;
     await waitForSockets(1);
+
+    await connector.shutdown(); // see the note on the previous test
   });
 
   it('a lock genuinely held by another container still ends in failed once the budget runs out', async () => {
@@ -395,7 +403,14 @@ describe('the single-owner instance lock (architecture §11.3)', () => {
       await new Promise((r) => setTimeout(r, 25));
     }
 
-    expect(h.sockets).toHaveLength(0);
+    // Deliberately no assertion on `h.sockets` here. That array is shared by
+    // every test in this file, and this test spends seconds inside a retry
+    // loop — long enough for a neighbour's timer to land in it, which is
+    // exactly how this test was flaky before. "A denied lock opens no socket"
+    // is already pinned synchronously by the first test in this block, where
+    // there is no timing window at all; repeating it here bought no coverage
+    // and cost determinism. What this test is for is the END STATE.
+    await connector.shutdown();
   });
 
   it('opens the socket normally once the lock is acquired', async () => {
