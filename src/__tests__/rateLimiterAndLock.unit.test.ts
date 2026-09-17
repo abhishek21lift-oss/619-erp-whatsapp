@@ -60,7 +60,7 @@ class FakeLockRateRedis {
     const argv = rest.slice(numKeys);
 
     if (script === REFRESH_SCRIPT) {
-      const [key] = keys;
+      const [key] = keys as [string];
       const [ownerId, ttlSec] = argv as [string, number];
       if (this.#get(key) !== ownerId) return Promise.resolve(0);
       this.strings.set(key, { value: ownerId, expiresAt: Date.now() + Number(ttlSec) * 1000 });
@@ -68,7 +68,7 @@ class FakeLockRateRedis {
     }
 
     if (script === RELEASE_SCRIPT) {
-      const [key] = keys;
+      const [key] = keys as [string];
       const [ownerId] = argv as [string];
       if (this.#get(key) !== ownerId) return Promise.resolve(0);
       this.strings.delete(key);
@@ -76,8 +76,13 @@ class FakeLockRateRedis {
     }
 
     if (script === TOKEN_BUCKET_SCRIPT) {
-      const [bucketKey, dailyKey] = keys;
-      const [now, burst, refillPerMs, dailyCap, , dailyTtlSec] = (argv as unknown[]).map(Number);
+      // Tuple casts, not bare destructuring: tsconfig.check.json (the config
+      // CI type-checks tests with) sets noUncheckedIndexedAccess, so every
+      // element would otherwise be `T | undefined`. The production code calls
+      // eval() with exactly this arity, which is what makes the cast honest.
+      const [bucketKey, dailyKey] = keys as [string, string];
+      const [now, burst, refillPerMs, dailyCap, , dailyTtlSec] =
+        (argv as unknown[]).map(Number) as [number, number, number, number, number, number];
 
       const dailyRaw = this.#get(dailyKey);
       const daily = dailyRaw != null ? Number(dailyRaw) : 0;
