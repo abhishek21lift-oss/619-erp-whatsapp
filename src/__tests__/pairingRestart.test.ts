@@ -346,7 +346,55 @@ describe('the single-owner instance lock (architecture §11.3)', () => {
 
     const state = await connector.start(INSTANCE);
 
-    expect(state).toBe(InstanceState.FAILED);
+    // No socket, and the ERP is told honestly that a retry is coming.
+    expect(h.sockets).toHaveLength(0);
+    expect(state).toBe(InstanceState.RECONNECTING);
+    expect(events).toContain('whatsapp.instance.disconnected');
+  });
+
+  it('retries a held lock rather than parking in failed — the restart case, not a second container', async () => {
+    // `docker restart` gives the old process 10s (its own default, not
+    // compose's 30s stop_grace_period), so a SIGKILLed shutdown leaves its
+    // locks held for the lock's 30s TTL while the new container is already
+    // restoring. That clears itself; failing terminally would leave a studio
+    // disconnected until somebody pressed Reconnect.
+    let held = true;
+    const staleLock: InstanceType<typeof AlwaysAcquiredInstanceLock> = {
+      acquire: async () => !held,
+      refresh: async () => true,
+      release: async () => {},
+    };
+    const connector = build({ lock: staleLock, reconnectBaseMs: 10, reconnectMaxMs: 20 });
+
+    expect(await connector.start(INSTANCE)).toBe(InstanceState.RECONNECTING);
+    expect(h.sockets).toHaveLength(0);
+
+    // The dead process's lock expires; the armed retry now gets through.
+    held = false;
+    await waitForSockets(1);
+  });
+
+  it('a lock genuinely held by another container still ends in failed once the budget runs out', async () => {
+    const deniedLock: InstanceType<typeof AlwaysAcquiredInstanceLock> = {
+      acquire: async () => false,
+      refresh: async () => true,
+      release: async () => {},
+    };
+    // One attempt, so the budget is spent after a single retry. The delay is
+    // not tunable below backoff.ts's MIN_RECONNECT_DELAY_MS (500ms) — that
+    // floor is deliberate anti-hammer protection — so this polls for the
+    // outcome rather than sleeping on a guess.
+    const connector = build({ lock: deniedLock, reconnectMaxAttempts: 1 });
+    await connector.start(INSTANCE);
+
+    const deadline = Date.now() + 5_000;
+    while (connector.stateOf(INSTANCE) !== InstanceState.FAILED) {
+      if (Date.now() > deadline) {
+        throw new Error(`expected failed, still ${connector.stateOf(INSTANCE)} after 5s`);
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
     expect(h.sockets).toHaveLength(0);
   });
 

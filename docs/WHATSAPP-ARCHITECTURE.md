@@ -818,6 +818,20 @@ lock mid-connection (a missed refresh — a long GC pause, a Redis blip) closes
 the socket rather than continuing to run unprotected; see
 `pairingRestart.test.ts`'s lock describe block for the pinned behaviour.
 
+**A held lock is retried, not terminal** — §13.1's table says the loser
+"refuses to start that socket and logs at error", and it does, but it then
+arms the ordinary bounded reconnect budget rather than parking in `failed`.
+The reason is that the common case is not a second container at all: it is
+this one restarting. `deploy-vps.yml` runs `docker restart`, which gives the
+old process **10s** — its own default, not the 30s `stop_grace_period` the
+compose file declares — so a shutdown that outruns that is SIGKILLed with its
+locks still held, and they linger for the 30s TTL while the new container is
+already restoring. Failing terminally there would leave a studio's WhatsApp
+down until an operator pressed Reconnect, over a condition that clears itself
+inside a backoff step or two. A genuine two-container conflict is still
+caught: the budget exhausts and the instance lands in `failed` with
+`reconnect_attempts_exhausted`.
+
 ### 11.4 Redis unavailable
 
 The ERP degrades to inline sends when Redis is down. The gateway **cannot**:

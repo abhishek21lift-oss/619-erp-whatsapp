@@ -310,12 +310,26 @@ export class BaileysConnector implements WhatsAppConnector {
     // does fire it means two containers are live for the same instance.
     const acquiredLock = await this.#deps.lock.acquire(instanceId);
     if (!acquiredLock) {
-      runtime.state = InstanceState.FAILED;
       runtime.lastErrorCode = 'lock_contention';
       log.error(
         { status: 'error' },
         'instance_lock_held_by_another_process — refusing to open a second socket for this instance',
       );
+
+      // Retried on the same bounded budget as any other transient failure,
+      // NOT parked in `failed` — because the common case is not a second
+      // container at all, it is this one restarting. `docker restart` (which
+      // deploy-vps.yml runs) gives the old process 10s by its own default,
+      // not the 30s stop_grace_period compose declares, so a shutdown that
+      // outruns that is SIGKILLed with its locks still held — and they then
+      // linger for the lock's own 30s TTL while the new container is already
+      // restoring. Failing terminally there would leave a studio's WhatsApp
+      // down until somebody pressed Reconnect, over a condition that clears
+      // itself inside one or two backoff steps. A genuine two-container
+      // conflict is still caught: the budget exhausts and #scheduleReconnect
+      // lands the instance in `failed` with reconnect_attempts_exhausted.
+      const schedule = this.#scheduleReconnect(instanceId, runtime, 'lock_contention');
+      await this.#emitDisconnected(instanceId, tenantId, 'lock_contention', schedule);
       return runtime.state;
     }
     runtime.lockRefreshTimer = setInterval(() => {
