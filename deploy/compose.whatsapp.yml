@@ -6,6 +6,12 @@ services:
     container_name: myptstudio-whatsapp
     build:
       context: ./619-erp-whatsapp
+      # Baked into the image: a production image has no .git directory. The
+      # deploy workflow exports these before building; a plain build leaves
+      # them empty and the release honestly reports sha "unknown".
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-}
     restart: unless-stopped
 
     environment:

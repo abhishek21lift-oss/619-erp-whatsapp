@@ -14,6 +14,7 @@ import type { FastifyInstance } from 'fastify';
 import { access, constants } from 'node:fs/promises';
 import type { RedisHandle } from '../store/redis.js';
 import type { InstanceRegistry } from '../domain/registry.js';
+import { releaseInfo } from '../release.js';
 
 export const PUBLIC_PATHS = ['/healthz', '/readyz'] as const;
 
@@ -41,6 +42,11 @@ export function registerHealthRoutes(app: FastifyInstance, deps: HealthDeps): vo
     service: '619-erp-whatsapp',
     version: deps.version,
     uptime_s: Math.round(process.uptime()),
+    // The deployed commit and the wire contract this build speaks. Liveness is
+    // the endpoint a deployment check can always reach — it touches nothing
+    // external by design — which makes it the right place to answer "did my
+    // deploy land, and does it still agree with the backend".
+    release: releaseInfo(),
   }));
 
   app.get('/readyz', async (_request, reply) => {

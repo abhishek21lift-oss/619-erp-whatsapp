@@ -62,8 +62,19 @@ COPY --chown=wa:nodejs package.json ./
 
 USER wa
 
+# ── Release identity, baked at build time ──────────────────────────────────
+#
+# A production image has no .git directory, so `git rev-parse` at runtime
+# returns nothing on exactly the machine where the answer matters. The default
+# keeps a plain `docker build` working — src/release.ts reports "unknown",
+# which is the honest answer for a locally built image.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=""
+
 ENV NODE_ENV=production \
     PORT=8080 \
+    GIT_SHA=$GIT_SHA \
+    BUILD_TIME=$BUILD_TIME \
     WA_SESSION_DIR=/data/sessions \
     WA_MANIFEST_PATH=/data/instances.json \
     WA_QUARANTINE_DIR=/data/quarantine
