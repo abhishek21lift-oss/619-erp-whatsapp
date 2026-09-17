@@ -14,6 +14,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { buildHarness, authHeaders, newId, ORG_A, ORG_B, type Harness } from './helpers.js';
+import { GatewayError } from '../errors.js';
 
 const TO = '+919876543210';
 
@@ -263,6 +264,30 @@ describe('outbound messages', () => {
       const retry = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
       expect(retry.statusCode).toBe(200);
       expect(h.connector.sent).toHaveLength(1);
+    });
+
+    // ── The one failure that is certainly permanent ───────────────────────
+    //
+    // Every other throw out of the connector becomes an INTERNAL with
+    // will_retry: true, which is right — a send that threw against a connected
+    // socket is usually a blip. A number that is not on WhatsApp is not: it
+    // will not be on WhatsApp on the second attempt either. Flattened into the
+    // generic case, the ERP would spend its whole attempt budget re-addressing
+    // a message to somebody who does not exist and then record a failure that
+    // says nothing about why.
+    it('keeps a not-on-WhatsApp refusal permanent and named', async () => {
+      h.connector.failNextSend = GatewayError.recipientNotOnWhatsApp({ instance_id: 'inst' });
+
+      const res = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
+      expect(res.statusCode).toBe(422);
+      expect(res.json().error.code).toBe('RECIPIENT_NOT_ON_WHATSAPP');
+
+      const failed = h.outbox.events.filter((e) => e.event_type === 'whatsapp.message.failed');
+      expect(failed[0]?.payload).toMatchObject({
+        client_message_id: 'cm-1',
+        reason_code: 'recipient_not_on_whatsapp',
+        will_retry: false,
+      });
     });
 
     it('does not leak the underlying error to the caller', async () => {

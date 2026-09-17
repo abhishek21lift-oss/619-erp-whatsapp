@@ -89,8 +89,16 @@ export class FakeConnector implements WhatsAppConnector {
 
   /** Every send this connector was asked to make, in order. */
   readonly sent: { instanceId: string; to: string; text: string }[] = [];
-  /** Set to make the next sendText throw, for the failure-event path. */
-  failNextSend: string | null = null;
+  /**
+   * Set to make the next sendText throw, for the failure-event path.
+   *
+   * A string is wrapped in a plain Error — a transport blip. An Error is
+   * thrown as given, which is how the typed refusals are exercised: the
+   * registry has to tell a GatewayError carrying RECIPIENT_NOT_ON_WHATSAPP
+   * apart from everything else, and it cannot do that if the fake can only
+   * produce one shape of failure.
+   */
+  failNextSend: string | Error | null = null;
   #messageSeq = 0;
 
   sendText(instanceId: string, to: string, text: string): Promise<{ provider_message_id: string }> {
@@ -98,7 +106,7 @@ export class FakeConnector implements WhatsAppConnector {
     if (this.failNextSend) {
       const reason = this.failNextSend;
       this.failNextSend = null;
-      return Promise.reject(new Error(reason));
+      return Promise.reject(typeof reason === 'string' ? new Error(reason) : reason);
     }
     // Mirrors the real connector's refusal rather than trusting the registry
     // to have checked: a test that passes only because the fake is permissive

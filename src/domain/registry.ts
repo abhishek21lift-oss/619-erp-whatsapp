@@ -11,7 +11,7 @@
 // route is trusted to remember.
 
 import { randomUUID } from 'node:crypto';
-import { GatewayError } from '../errors.js';
+import { ErrorCode, GatewayError } from '../errors.js';
 import { operationLogger } from '../logger.js';
 import type { Manifest } from '../store/manifest.js';
 import type { QrReader } from '../store/qr.js';
@@ -304,7 +304,16 @@ export class InstanceRegistry {
     } catch (err) {
       await this.#sendLedger.release(record.instance_id, message.client_message_id);
 
-      const reasonCode = 'send_failed';
+      // A number that is not on WhatsApp is the one send failure that is
+      // certainly permanent, and it has to survive this catch with that fact
+      // intact. Flattened into an INTERNAL with will_retry: true — which is
+      // what every other throw here becomes — the ERP would spend its whole
+      // attempt budget re-addressing a message to somebody who does not exist,
+      // and then record a generic failure that says nothing about why.
+      const permanent =
+        err instanceof GatewayError && err.code === ErrorCode.RECIPIENT_NOT_ON_WHATSAPP;
+
+      const reasonCode = permanent ? 'recipient_not_on_whatsapp' : 'send_failed';
       await this.#outbox.enqueue(EventType.MESSAGE_FAILED, {
         instanceId: record.instance_id,
         tenantId: record.organization_id,
@@ -314,12 +323,14 @@ export class InstanceRegistry {
           // The ERP decides; this is advice. A send that threw against a
           // connected socket is a transport blip far more often than a
           // permanent refusal, and the ERP's attempt budget bounds it either
-          // way.
-          will_retry: true,
+          // way — except for the one case above, where retrying is certainly
+          // pointless and saying so is the whole value of the distinct code.
+          will_retry: !permanent,
         },
       });
 
       log.error({ status: 'error', err: (err as Error).message }, 'message_send_failed');
+      if (permanent) throw err;
       throw GatewayError.internal('Could not send the message.', {
         client_message_id: message.client_message_id,
       });

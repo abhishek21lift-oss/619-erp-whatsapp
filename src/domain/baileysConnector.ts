@@ -33,6 +33,7 @@ import { EventType } from '../events/schema.js';
 import { InstanceState, type InstanceStateValue, type WhatsAppConnector } from './instance.js';
 import { classifyDisconnect, disconnectStatusCode } from './disconnect.js';
 import { ReconnectScheduler } from './reconnectScheduler.js';
+import { GatewayError } from '../errors.js';
 import type { InstanceLock } from '../store/instanceLock.js';
 
 /** How often the held lock's TTL is renewed while a socket is live (architecture §11.3). */
@@ -308,7 +309,20 @@ export class BaileysConnector implements WhatsAppConnector {
     // start this socket — logged at error, since in a correctly-run MVP
     // (exactly one gateway container) this should never happen, and if it
     // does fire it means two containers are live for the same instance.
-    const acquiredLock = await this.#deps.lock.acquire(instanceId);
+    // A THROW here is treated as a refusal, not allowed to escape. The lock
+    // lives in Redis, so `acquire` can reject for reasons that have nothing to
+    // do with who owns the instance — and the reconnect path that calls this
+    // only logs what escapes it, scheduling nothing. One Redis blip during a
+    // reconnect would therefore park a studio's WhatsApp until somebody
+    // pressed Reconnect by hand. Folding it into the refusal below puts it on
+    // the same bounded retry budget as every other transient failure.
+    let acquiredLock: boolean;
+    try {
+      acquiredLock = await this.#deps.lock.acquire(instanceId);
+    } catch (err) {
+      log.error({ status: 'error', err: (err as Error).message }, 'instance_lock_unavailable');
+      acquiredLock = false;
+    }
     if (!acquiredLock) {
       runtime.lastErrorCode = 'lock_contention';
       log.error(
@@ -346,6 +360,19 @@ export class BaileysConnector implements WhatsAppConnector {
           'instance_lock_lost — closing this socket; another process may now own this instance',
         );
         void this.#closeSocket(instanceId, runtime, { deliberate: true });
+      }).catch((err: Error) => {
+        // A refresh that THREW is not a refresh that returned false, and the
+        // difference decides whether this socket lives. `false` means another
+        // process owns the lock — act on it. A throw means Redis could not
+        // answer, which says nothing about ownership, so the socket stays up
+        // and the next tick tries again: refresh runs every 10s against a 30s
+        // TTL, so two consecutive failures still leave an attempt in hand.
+        //
+        // The .catch is not optional either way. Without it a rejected refresh
+        // is an unhandled rejection, and node's default for those is to
+        // terminate the process — taking every other studio's connection with
+        // it, over a Redis blip on one.
+        log.warn({ status: 'ok', err: err.message }, 'instance_lock_refresh_failed');
       });
     }, LOCK_REFRESH_INTERVAL_MS);
     runtime.lockRefreshTimer.unref();
@@ -869,6 +896,8 @@ export class BaileysConnector implements WhatsAppConnector {
       throw new Error(`Instance is not connected (state: ${runtime.state}).`);
     }
 
+    await this.#assertOnWhatsApp(instanceId, to);
+
     const result = await sock.sendMessage(toJid(to), { text });
     const providerMessageId = result?.key?.id;
     if (!providerMessageId) {
@@ -885,6 +914,65 @@ export class BaileysConnector implements WhatsAppConnector {
     }).info({ status: 'ok', provider_message_id: providerMessageId }, 'message_sent');
 
     return { provider_message_id: providerMessageId };
+  }
+
+  /**
+   * Refuse to send to a number nobody has on WhatsApp.
+   *
+   * ── Why this check exists at all ────────────────────────────────────────
+   *
+   * `sock.sendMessage` does not fail for a JID that belongs to nobody. It
+   * resolves, with a message key, indistinguishable from a real send — so the
+   * ERP records 'sent', stores the provider id, and shows the studio a row
+   * that looks delivered. Nothing ever contradicts it, because the only thing
+   * that would have is the delivery receipt that is never coming.
+   *
+   * That is not hypothetical. Every client mobile in production was stored as
+   * ten bare digits, the country code was never added, and eight messages over
+   * eight days were addressed to JIDs for nobody. The backend now resolves
+   * numbers to E.164 before they get here, which fixes that cause; this
+   * refuses the whole class, whatever the cause. A typo in one client's number
+   * is the same bug with no code change behind it.
+   *
+   * ── Why an unavailable lookup still sends ───────────────────────────────
+   *
+   * `onWhatsApp` is a USync query over the live socket, so it can fail for
+   * reasons that have nothing to do with the number. Treating that as "not on
+   * WhatsApp" would stop a studio's messages during a blip, which is a worse
+   * failure than the one this prevents. So the check fails OPEN when it cannot
+   * answer and CLOSED only when it answers that nobody is there.
+   *
+   * Baileys reports absence by omission: the result list is filtered to the
+   * contacts that exist, so an unregistered number comes back as an empty
+   * array rather than as `exists: false`.
+   */
+  async #assertOnWhatsApp(instanceId: string, to: string): Promise<void> {
+    const sock = this.#runtime(instanceId).sock;
+    if (!sock) return;
+
+    const log = operationLogger({
+      instance_id: instanceId,
+      tenant_id: this.#deps.resolveTenant(instanceId),
+      operation: 'connector.send',
+    });
+
+    let list: { jid: string; exists: boolean }[] | undefined;
+    try {
+      list = await sock.onWhatsApp(toJid(to));
+    } catch (err) {
+      // The lookup itself broke. Fail open, and say so — a log line here is
+      // how "sends quietly stopped being checked" stays visible.
+      log.warn({ status: 'ok', err: (err as Error).message }, 'recipient_check_unavailable');
+      return;
+    }
+
+    if (list === undefined) return; // No answer. Fail open, as above.
+    if (list.some((entry) => entry.exists)) return;
+
+    // No number in the log line or in the error: a client's phone number is
+    // their personal contact detail and does not belong in a log file.
+    log.warn({ status: 'error' }, 'recipient_not_on_whatsapp');
+    throw GatewayError.recipientNotOnWhatsApp({ instance_id: instanceId });
   }
 
   /**

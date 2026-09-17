@@ -23,6 +23,21 @@ export const ErrorCode = {
   INSTANCE_NOT_CONNECTED: 'INSTANCE_NOT_CONNECTED',
   /** A send whose client_message_id is already in flight on this instance. */
   DUPLICATE_MESSAGE: 'DUPLICATE_MESSAGE',
+  /**
+   * The number is not registered on WhatsApp.
+   *
+   * Its own code, and a permanent one, because of what happens without it.
+   * `sock.sendMessage` to a JID nobody owns does not fail — it resolves with a
+   * message key exactly like a real send — so a message addressed to a number
+   * that is not on WhatsApp was accepted, acknowledged, recorded 'sent' by the
+   * ERP, and never received by anyone. Eight of them went out that way in
+   * production before the missing delivery receipts gave it away.
+   *
+   * Retrying cannot help: the number will not be on WhatsApp on the second
+   * attempt either. So the ERP must be able to tell this apart from a
+   * transport blip, which is what a distinct code is for.
+   */
+  RECIPIENT_NOT_ON_WHATSAPP: 'RECIPIENT_NOT_ON_WHATSAPP',
   QR_EXPIRED: 'QR_EXPIRED',
   RATE_LIMITED: 'RATE_LIMITED',
   CAPACITY_REACHED: 'CAPACITY_REACHED',
@@ -109,6 +124,20 @@ export class GatewayError extends Error {
       409,
       'A message with this client_message_id is already being sent.',
       { client_message_id: clientMessageId },
+    );
+  }
+
+  /**
+   * 422, not 400: the request is well-formed and the number is a valid E.164
+   * one. What is wrong is a fact about the world — nobody has that number on
+   * WhatsApp — which is precisely what "unprocessable" means.
+   */
+  static recipientNotOnWhatsApp(context?: Record<string, unknown>): GatewayError {
+    return new GatewayError(
+      ErrorCode.RECIPIENT_NOT_ON_WHATSAPP,
+      422,
+      'That number is not registered on WhatsApp.',
+      context,
     );
   }
 
