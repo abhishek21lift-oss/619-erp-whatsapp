@@ -6,6 +6,8 @@ import { getLogger } from './logger.js';
 import { buildApp } from './app.js';
 import { createRedis } from './store/redis.js';
 import { RedisSendLedger } from './store/sendLedger.js';
+import { RedisSendRateLimiter } from './store/rateLimiter.js';
+import { RedisInstanceLock } from './store/instanceLock.js';
 import { QrStore } from './store/qr.js';
 import { Manifest } from './store/manifest.js';
 import { Outbox } from './events/outbox.js';
@@ -67,6 +69,12 @@ async function main(): Promise<void> {
   const outbox = new Outbox(redis.client);
   const qr = new QrStore(redis.client, config.WA_QR_TTL_SEC);
   const sendLedger = new RedisSendLedger(redis.client, config.WA_SEND_DEDUPE_TTL_SEC);
+  const rateLimiter = new RedisSendRateLimiter(redis.client, {
+    sustainedPerMinute: config.WA_SEND_RATE_SUSTAINED_PER_MIN,
+    burst: config.WA_SEND_RATE_BURST,
+    dailyCap: config.WA_SEND_DAILY_CAP,
+  });
+  const instanceLock = new RedisInstanceLock(redis.client);
 
   // The manifest is the single source of instance ownership, so the connector
   // asks it rather than keeping a second copy that could drift from the
@@ -78,6 +86,7 @@ async function main(): Promise<void> {
           sessionRoot: config.WA_SESSION_DIR,
           qr,
           outbox,
+          lock: instanceLock,
           resolveTenant: (instanceId) => manifest.get(instanceId)?.organization_id,
           quarantineRoot: config.WA_QUARANTINE_DIR,
           qrTtlSec: config.WA_QR_TTL_SEC,
@@ -97,7 +106,9 @@ async function main(): Promise<void> {
     qr,
     outbox,
     sendLedger,
+    rateLimiter,
     maxInstances: config.WA_MAX_INSTANCES,
+    sendJitterMs: { min: config.WA_SEND_JITTER_MIN_MS, max: config.WA_SEND_JITTER_MAX_MS },
   });
 
   // Sweep BEFORE restoring. A restore can quarantine a fresh directory, and

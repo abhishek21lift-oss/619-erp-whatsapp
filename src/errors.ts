@@ -120,6 +120,24 @@ export class GatewayError extends Error {
     );
   }
 
+  /**
+   * A send refused by the per-instance token bucket or daily cap (architecture
+   * §18, "Send"). 429, with a `retry_after_ms` the ERP's worker should honour
+   * rather than retrying immediately — this is a load-shedding refusal, not a
+   * transport failure, and retrying it fast is exactly the "fixed-interval
+   * sending" pattern (§19) the limiter exists to prevent.
+   */
+  static rateLimited(retryAfterMs: number, reason: 'burst' | 'daily_cap'): GatewayError {
+    return new GatewayError(
+      ErrorCode.RATE_LIMITED,
+      429,
+      reason === 'daily_cap'
+        ? 'This instance has reached its daily send limit.'
+        : 'Sending too fast for this instance — slow down and retry shortly.',
+      { retry_after_ms: retryAfterMs, reason },
+    );
+  }
+
   static capacityReached(max: number): GatewayError {
     return new GatewayError(
       ErrorCode.CAPACITY_REACHED,

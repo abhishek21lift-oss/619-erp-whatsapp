@@ -37,6 +37,7 @@ const h = vi.hoisted(() => {
     end: (err: unknown) => Promise<void>;
     user: undefined;
     emit: (update: Record<string, unknown>) => Promise<void>;
+    ended: boolean;
   }
   const sockets: FakeSocket[] = [];
 
@@ -44,8 +45,9 @@ const h = vi.hoisted(() => {
     const handlers = new Map<string, (arg: unknown) => void>();
     const sock: FakeSocket = {
       ev: { on: (event, cb) => { handlers.set(event, cb); } },
-      end: async () => { /* a real end() fires close; the connector guards that */ },
+      end: async () => { sock.ended = true; /* a real end() fires close; the connector guards that */ },
       user: undefined,
+      ended: false,
       // Dispatches one connection.update. It does NOT wait for whatever the
       // connector kicks off — see waitForSockets/settle below for why counting
       // microtask ticks here was not good enough.
@@ -75,6 +77,7 @@ vi.mock('baileys', async () => {
 const { BaileysConnector } = await import('../domain/baileysConnector.js');
 const { InstanceState } = await import('../domain/instance.js');
 const { setLoggerForTesting } = await import('../logger.js');
+const { AlwaysAcquiredInstanceLock } = await import('../store/instanceLock.js');
 
 const INSTANCE = 'aaaaaaaa-0000-4000-8000-000000000001';
 const ORG = '11111111-1111-4111-8111-111111111111';
@@ -139,7 +142,7 @@ async function settle(ms = 100): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-function build(overrides: Record<string, number> = {}) {
+function build(overrides: Record<string, unknown> = {}) {
   qrWrites = [];
   events = [];
 
@@ -154,6 +157,7 @@ function build(overrides: Record<string, number> = {}) {
       enqueue: async (type: string) => { events.push(type); return undefined as never; },
     } as never,
     resolveTenant: () => ORG,
+    lock: new AlwaysAcquiredInstanceLock(),
     qrTtlSec: 60,
     qrMaxRounds: 5,
     pairingMaxRounds: 4,
@@ -323,5 +327,74 @@ describe('a connection that really did fail still backs off', () => {
 
     expect(h.sockets).toHaveLength(socketsBefore);
     expect(events).toContain('whatsapp.instance.disconnected');
+  });
+});
+
+describe('the single-owner instance lock (architecture §11.3)', () => {
+  // Deep-audit finding: `wa:lock:<instance_id>` was defined as a Redis key
+  // but never read or written anywhere — the doc's "exactly one gateway
+  // container" was an unchecked assumption. These pin that start() now
+  // actually consults the lock before opening a socket.
+
+  it('refuses to open a socket when another process holds the lock', async () => {
+    const deniedLock: InstanceType<typeof AlwaysAcquiredInstanceLock> = {
+      acquire: async () => false,
+      refresh: async () => true,
+      release: async () => {},
+    };
+    const connector = build({ lock: deniedLock });
+
+    const state = await connector.start(INSTANCE);
+
+    expect(state).toBe(InstanceState.FAILED);
+    expect(h.sockets).toHaveLength(0);
+  });
+
+  it('opens the socket normally once the lock is acquired', async () => {
+    const connector = build(); // default AlwaysAcquiredInstanceLock
+    const state = await connector.start(INSTANCE);
+
+    expect(state).toBe(InstanceState.CONNECTING);
+    expect(h.sockets).toHaveLength(1);
+  });
+
+  it('stopping closes the socket, releasing the lock so another process could take over', async () => {
+    // #closeSocket releases the lock unconditionally, even the very first
+    // time it runs with nothing yet to close (a harmless no-op against a
+    // lock we don't hold) — so what this pins is the release call stop()
+    // triggers for the socket that was actually live, not merely that
+    // release() was called at all.
+    let releaseCalls = 0;
+    const trackingLock: InstanceType<typeof AlwaysAcquiredInstanceLock> = {
+      acquire: async () => true,
+      refresh: async () => true,
+      release: async () => { releaseCalls += 1; },
+    };
+    const connector = build({ lock: trackingLock });
+    await connector.start(INSTANCE);
+    const releasesAfterStart = releaseCalls;
+
+    await connector.stop(INSTANCE);
+    expect(releaseCalls).toBe(releasesAfterStart + 1);
+  });
+
+  it('losing the lock mid-connection closes the socket rather than running unprotected', async () => {
+    vi.useFakeTimers();
+    let refreshShouldSucceed = true;
+    const flakyLock: InstanceType<typeof AlwaysAcquiredInstanceLock> = {
+      acquire: async () => true,
+      refresh: async () => refreshShouldSucceed,
+      release: async () => {},
+    };
+    const connector = build({ lock: flakyLock });
+    await connector.start(INSTANCE);
+    expect(h.sockets).toHaveLength(1);
+
+    refreshShouldSucceed = false;
+    await vi.advanceTimersByTimeAsync(10_000); // LOCK_REFRESH_INTERVAL_MS
+    // Let the refresh promise's .then() callback run.
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(socket(0).ended).toBe(true);
   });
 });

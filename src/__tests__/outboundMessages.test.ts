@@ -150,6 +150,65 @@ describe('outbound messages', () => {
     });
   });
 
+  describe('send rate limiting (architecture §18)', () => {
+    // Deep-audit finding: the only rate limiting actually wired up used to be
+    // the generic per-org API limiter, which throttles how often the ERP may
+    // CALL this service, not how much WhatsApp volume goes out. A backend bug
+    // calling this endpoint in a loop had no gateway-side guardrail against
+    // "fixed-interval sending is a machine signature" (§19).
+
+    it('refuses a send the token bucket denies, with 429 and nothing sent', async () => {
+      h.rateLimiter.denyNext = { allowed: false, retryAfterMs: 2_500, reason: 'burst' };
+
+      const res = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
+
+      expect(res.statusCode).toBe(429);
+      expect(res.json().error.code).toBe('RATE_LIMITED');
+      expect(h.connector.sent).toEqual([]);
+    });
+
+    it('checks the rate limit BEFORE claiming the send-once id', async () => {
+      // Nothing was attempted, so the ERP's retry of the exact same message
+      // once it backs off must see a FRESH claim, not "already in flight".
+      h.rateLimiter.denyNext = { allowed: false, retryAfterMs: 1_000, reason: 'burst' };
+      const refused = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
+      expect(refused.statusCode).toBe(429);
+
+      const retry = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
+      expect(retry.statusCode).toBe(200);
+      expect(retry.json().duplicate).toBe(false);
+    });
+
+    it('emits no message event for a send the rate limiter refused', async () => {
+      h.rateLimiter.denyNext = { allowed: false, retryAfterMs: 1_000, reason: 'burst' };
+      await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
+
+      expect(h.outbox.events.some((e) => e.event_type.startsWith('whatsapp.message'))).toBe(false);
+    });
+
+    it('a daily-cap refusal is distinguishable from a burst refusal', async () => {
+      h.rateLimiter.denyNext = { allowed: false, retryAfterMs: 86_400_000, reason: 'daily_cap' };
+
+      const res = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });
+
+      expect(res.statusCode).toBe(429);
+      expect(res.json().error.message).toMatch(/daily/i);
+    });
+
+    it('checks connection state before the rate limit, consistent with the documented order', async () => {
+      const idle = newId();
+      await h.registry.create(idle, ORG_A);
+      h.rateLimiter.denyNext = { allowed: false, retryAfterMs: 1_000, reason: 'burst' };
+
+      const res = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' }, ORG_A, idle);
+
+      // NOT_CONNECTED, not RATE_LIMITED — the rate limiter is never consulted
+      // for an instance with no live socket to send on.
+      expect(res.json().error.code).toBe('INSTANCE_NOT_CONNECTED');
+      expect(h.rateLimiter.calls).toEqual([]);
+    });
+  });
+
   describe('send-once under retry', () => {
     it('returns the original provider id instead of sending twice', async () => {
       const first = await send({ to: TO, text: 'hi', client_message_id: 'cm-1' });

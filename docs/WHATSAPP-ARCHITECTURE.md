@@ -655,9 +655,23 @@ loop that can be stepped one tick at a time in a test.
 
 ## 9. Message lifecycle
 
-> **Not in the MVP.** Documented so the MVP's event ledger, provider seam, and
-> rate limiter are built once, correctly, rather than retrofitted. No send
-> endpoint ships in the MVP.
+> **Shipped, not post-MVP.** This section was written while the send path was
+> still planned and said so at the top ("No send endpoint ships in the MVP").
+> That went stale without this note being updated: `POST
+> /v1/instances/:id/messages` (routes/instances.ts → registry.sendMessage() →
+> the connector) is implemented, tested (outboundMessages.test.ts), backed by
+> the send-once ledger (§7.3) described below, and live. A deep audit flagged
+> the drift specifically because it meant a reviewer trusting this note would
+> skip auditing that code path — which is exactly where the missing send-rate
+> limiter (§18) was found. The ERP-side integration also ended up named
+> differently than §9.2 below describes: the live seam is
+> `619-erp-backend`'s `src/modules/messaging/transport.js` (resolves the
+> studio's own gateway instance, refuses to fall back to a shared Twilio
+> number for automated sends), not a `whatsappProvider.js` module — the
+> no-fallback rule in §9.3 is the one part of this section verified accurate
+> against the shipped code. §9.1, §9.2 and §9.4 below describe the original
+> design and have not been re-verified line-by-line against the final ERP-side
+> module names.
 
 ### 9.1 The existing ERP path, unchanged
 
@@ -793,6 +807,16 @@ the socket lives.
 **The MVP runs exactly one gateway container** (§15.3) — this lock is what makes
 that a *checked* invariant rather than an assumption that quietly breaks the
 first time someone scales the service to two replicas.
+
+Implemented in `store/instanceLock.ts`, wired into `BaileysConnector.#startInner`
+(acquired before the auth state is even read) and `#closeSocket` (released
+whenever a socket closes, for any reason). A deep audit found this section
+describing exactly the right design over a `wa:lock:<instance_id>` key that
+was defined (`store/redis.ts`) but never read or written anywhere — the
+"checked invariant" claim above was false until this was built. Losing the
+lock mid-connection (a missed refresh — a long GC pause, a Redis blip) closes
+the socket rather than continuing to run unprotected; see
+`pairingRestart.test.ts`'s lock describe block for the pinned behaviour.
 
 ### 11.4 Redis unavailable
 
@@ -1285,7 +1309,13 @@ Three layers, different jobs:
 instance-scoped routes. Protects the gateway from a backend bug (a runaway poll
 loop), not from an attacker; the attacker cannot reach it.
 
-**Send** (post-MVP) — token bucket per instance, `wa:ratelimit:<instance_id>`:
+**Send** — token bucket per instance, `wa:ratelimit:<instance_id>` (implemented
+in `store/rateLimiter.ts`, enforced in `registry.sendMessage()` before the
+send-once claim — a refused send throws `RATE_LIMITED` and touches neither
+the ledger nor the outbox, since nothing was attempted). This was labelled
+"post-MVP" here for a stretch during which the send endpoint above it (§9)
+was live with no rate limiting of any kind — a deep audit flagged that gap
+specifically; it no longer exists:
 
 | Setting | Default | Rationale |
 |---|---|---|

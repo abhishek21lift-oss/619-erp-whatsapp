@@ -70,6 +70,19 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // @fastify/cors with a strict origin list would imply that some browser
   // origin is expected to.
 
+  // Registered BEFORE the rate limiter, deliberately: both add a root-level
+  // `onRequest` hook, and Fastify runs those in registration order. With the
+  // rate limiter first (as this used to be), an unauthenticated request was
+  // still counted against its bucket before auth ever rejected it — keyed by
+  // the caller-supplied, unauthenticated `x-org-id` header below, which made
+  // the rate limiter's key technically attacker-influenced pre-auth. Auth
+  // first means a request that never presents a valid key never touches the
+  // rate limiter's accounting at all.
+  registerGatewayAuth(app, {
+    expectedKey: config.WA_GATEWAY_KEY,
+    publicPaths: PUBLIC_PATHS,
+  });
+
   await app.register(rateLimit, {
     max: config.WA_RATE_LIMIT_MAX,
     timeWindow: config.WA_RATE_LIMIT_WINDOW_MS,
@@ -84,11 +97,6 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     errorResponseBuilder: () => ({
       error: { code: ErrorCode.RATE_LIMITED, message: 'Too many requests.' },
     }),
-  });
-
-  registerGatewayAuth(app, {
-    expectedKey: config.WA_GATEWAY_KEY,
-    publicPaths: PUBLIC_PATHS,
   });
 
   // One structured line per request (architecture §14.1). Fastify's built-in

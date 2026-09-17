@@ -155,6 +155,26 @@ export const configSchema = z.object({
   // service at all.
   WA_RATE_LIMIT_MAX: intFromEnv(100, 1, 10_000),
   WA_RATE_LIMIT_WINDOW_MS: intFromEnv(60_000, 1_000, 3_600_000),
+
+  // Per-instance SEND rate limit (architecture §18, "Send") — a token bucket
+  // over outbound WhatsApp messages, not API calls. Deliberately conservative:
+  // WhatsApp publishes no rate limit for Web clients, so these numbers are
+  // chosen to sit inside plausible human behaviour rather than to approach an
+  // unknown ceiling (see §19 — this is anti-ban, not anti-abuse-evasion).
+  WA_SEND_RATE_SUSTAINED_PER_MIN: intFromEnv(20, 1, 1000),
+  WA_SEND_RATE_BURST: intFromEnv(10, 1, 1000),
+  WA_SEND_DAILY_CAP: intFromEnv(1000, 1, 100_000),
+
+  /**
+   * Random delay applied immediately before each send.
+   *
+   * Fixed-interval sending is a machine signature (§19); jittering the exact
+   * moment a message leaves is cheap insurance against looking like one. Set
+   * both to 0 to disable — the test suite does exactly that, since a unit
+   * test sending N messages should not spend N seconds doing it.
+   */
+  WA_SEND_JITTER_MIN_MS: intFromEnv(1_000, 0, 60_000),
+  WA_SEND_JITTER_MAX_MS: intFromEnv(3_000, 0, 60_000),
 });
 
 export type Config = z.infer<typeof configSchema>;

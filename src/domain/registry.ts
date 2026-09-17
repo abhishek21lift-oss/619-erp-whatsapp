@@ -17,6 +17,7 @@ import type { Manifest } from '../store/manifest.js';
 import type { QrReader } from '../store/qr.js';
 import type { EventSink } from '../events/outbox.js';
 import type { SendLedger } from '../store/sendLedger.js';
+import type { SendRateLimiter } from '../store/rateLimiter.js';
 import { EventType } from '../events/schema.js';
 import { assertUuid } from '../store/paths.js';
 import {
@@ -33,7 +34,10 @@ export interface RegistryDeps {
   qr: QrReader;
   outbox: EventSink;
   sendLedger: SendLedger;
+  rateLimiter: SendRateLimiter;
   maxInstances: number;
+  /** Random per-send delay (architecture §18) — see config.ts's own comment. */
+  sendJitterMs: { min: number; max: number };
 }
 
 /** One outbound message, as the ERP asks for it. */
@@ -62,7 +66,9 @@ export class InstanceRegistry {
   readonly #qr: QrReader;
   readonly #outbox: EventSink;
   readonly #sendLedger: SendLedger;
+  readonly #rateLimiter: SendRateLimiter;
   readonly #maxInstances: number;
+  readonly #sendJitterMs: { min: number; max: number };
 
   constructor(deps: RegistryDeps) {
     this.#manifest = deps.manifest;
@@ -70,7 +76,9 @@ export class InstanceRegistry {
     this.#qr = deps.qr;
     this.#outbox = deps.outbox;
     this.#sendLedger = deps.sendLedger;
+    this.#rateLimiter = deps.rateLimiter;
     this.#maxInstances = deps.maxInstances;
+    this.#sendJitterMs = deps.sendJitterMs;
   }
 
   /**
@@ -225,7 +233,14 @@ export class InstanceRegistry {
    *
    * The order below is deliberate throughout:
    *
-   *   1. own it, 2. is it connected, 3. claim the id, 4. send, 5. record.
+   *   1. own it, 2. is it connected, 3. within rate limit, 4. claim the id,
+   *   5. send, 6. record.
+   *
+   * The rate-limit check sits BEFORE the ledger claim, on purpose: a refused
+   * send has attempted nothing, so it must not consume the idempotency slot
+   * for this client_message_id — the ERP's retry of the very same message
+   * has to see a fresh claim once the caller backs off, not a stale
+   * "already in flight" from an attempt that never started.
    *
    * Claiming before sending is what makes a retry safe (see sendLedger.ts).
    * Recording after is what makes the NEXT retry return the original id
@@ -248,6 +263,13 @@ export class InstanceRegistry {
       throw GatewayError.notConnected(state);
     }
 
+    const decision = await this.#rateLimiter.check(record.instance_id);
+    if (!decision.allowed) {
+      // Same reasoning as the not-connected branch above: nothing was
+      // attempted, so no event and no ledger claim.
+      throw GatewayError.rateLimited(decision.retryAfterMs, decision.reason ?? 'burst');
+    }
+
     const claim = await this.#sendLedger.claim(record.instance_id, message.client_message_id);
     if (!claim.fresh) {
       // Already sent under this id: hand back the ORIGINAL provider id so the
@@ -266,6 +288,15 @@ export class InstanceRegistry {
       tenant_id: record.organization_id,
       operation: 'registry.send',
     });
+
+    // Random per-send delay, applied after the ledger claim (so it never
+    // affects idempotency) and right before the message actually leaves —
+    // see sendJitterMs's own comment on RegistryDeps.
+    if (this.#sendJitterMs.max > 0) {
+      const jitter = this.#sendJitterMs.min
+        + Math.random() * (this.#sendJitterMs.max - this.#sendJitterMs.min);
+      await new Promise((resolve) => setTimeout(resolve, jitter));
+    }
 
     let result: { provider_message_id: string };
     try {
