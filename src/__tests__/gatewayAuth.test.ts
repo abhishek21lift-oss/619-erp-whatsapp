@@ -102,4 +102,37 @@ describe('gateway authentication', () => {
       expect(safeEqual('', '')).toBe(true);
     });
   });
+
+  describe('auth runs before the rate limiter', () => {
+    // Deep-audit finding: the rate limiter used to be registered before
+    // gatewayAuth. Both add a root `onRequest` hook, and Fastify runs those
+    // in registration order, so an unauthenticated request was still counted
+    // against its bucket — keyed by the caller-supplied, unauthenticated
+    // x-org-id header — before auth ever got a chance to reject it.
+    it('flooding with an invalid key never exhausts the rate-limit bucket', async () => {
+      const flooded = await buildHarness({ configOverrides: { WA_RATE_LIMIT_MAX: '3' } });
+      try {
+        // More requests than the bucket holds, all unauthenticated.
+        for (let i = 0; i < 10; i += 1) {
+          const res = await flooded.app.inject({
+            method: 'GET',
+            url: '/v1/instances',
+            headers: { 'x-gateway-key': 'wrong-but-long-enough-0123456789', 'x-org-id': ORG_A },
+          });
+          expect(res.statusCode).toBe(401);
+        }
+
+        // If the flood above had consumed the bucket, this authenticated
+        // request would now see 429 instead of a real response.
+        const authed = await flooded.app.inject({
+          method: 'GET',
+          url: '/v1/instances',
+          headers: authHeaders(ORG_A),
+        });
+        expect(authed.statusCode).toBe(200);
+      } finally {
+        await flooded.cleanup();
+      }
+    });
+  });
 });

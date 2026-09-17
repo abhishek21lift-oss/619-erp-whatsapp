@@ -21,6 +21,7 @@ import { InstanceState, type InstanceStateValue, type WhatsAppConnector } from '
 import type { QrReader, StoredQr } from '../store/qr.js';
 import type { EventSink } from '../events/outbox.js';
 import type { SendLedger, SendClaim } from '../store/sendLedger.js';
+import type { SendRateLimiter, RateLimitDecision } from '../store/rateLimiter.js';
 import type { GatewayEvent, EventTypeValue, EventPayloads } from '../events/schema.js';
 import { buildEvent } from '../events/schema.js';
 import type { RedisHandle } from '../store/redis.js';
@@ -42,6 +43,11 @@ export function testConfig(overrides: Record<string, string> = {}): Config {
     WA_GATEWAY_KEY: TEST_GATEWAY_KEY,
     WA_WEBHOOK_SECRET: TEST_WEBHOOK_SECRET,
     WA_BACKEND_URL: 'http://backend.test:5000',
+    // A test sending N messages should not spend N seconds doing it — see
+    // WA_SEND_JITTER_{MIN,MAX}_MS's own comment in config.ts. Individual
+    // tests that specifically exercise the jitter can still override these.
+    WA_SEND_JITTER_MIN_MS: '0',
+    WA_SEND_JITTER_MAX_MS: '0',
     ...overrides,
   } as NodeJS.ProcessEnv);
 }
@@ -180,6 +186,28 @@ export class FakeSendLedger implements SendLedger {
   }
 }
 
+/**
+ * An in-memory stand-in for RedisSendRateLimiter.
+ *
+ * Allows everything by default — most tests are not about rate limiting —
+ * with `denyNext` letting the handful that are force a single refusal
+ * without needing a real Redis and a real token bucket's timing.
+ */
+export class FakeSendRateLimiter implements SendRateLimiter {
+  denyNext: RateLimitDecision | null = null;
+  readonly calls: string[] = [];
+
+  check(instanceId: string): Promise<RateLimitDecision> {
+    this.calls.push(instanceId);
+    if (this.denyNext) {
+      const decision = this.denyNext;
+      this.denyNext = null;
+      return Promise.resolve(decision);
+    }
+    return Promise.resolve({ allowed: true, retryAfterMs: 0 });
+  }
+}
+
 export class FakeOutbox implements EventSink {
   readonly events: GatewayEvent[] = [];
 
@@ -226,6 +254,7 @@ export interface Harness {
   qr: FakeQrStore;
   outbox: FakeOutbox;
   sendLedger: FakeSendLedger;
+  rateLimiter: FakeSendRateLimiter;
   dir: string;
   cleanup(): Promise<void>;
 }
@@ -263,6 +292,7 @@ export async function buildHarness(
   const qr = new FakeQrStore();
   const outbox = new FakeOutbox();
   const sendLedger = new FakeSendLedger();
+  const rateLimiter = new FakeSendRateLimiter();
 
   const registry = new InstanceRegistry({
     manifest,
@@ -270,7 +300,9 @@ export async function buildHarness(
     qr,
     outbox,
     sendLedger,
+    rateLimiter,
     maxInstances: config.WA_MAX_INSTANCES,
+    sendJitterMs: { min: config.WA_SEND_JITTER_MIN_MS, max: config.WA_SEND_JITTER_MAX_MS },
   });
 
   const app = await buildApp({
@@ -289,6 +321,7 @@ export async function buildHarness(
     qr,
     outbox,
     sendLedger,
+    rateLimiter,
     dir,
     async cleanup() {
       await app.close();

@@ -157,7 +157,9 @@ describe('instance lifecycle', () => {
       qr: h.qr,
       outbox: h.outbox,
       sendLedger: h.sendLedger,
+      rateLimiter: h.rateLimiter,
       maxInstances: 50,
+      sendJitterMs: { min: 0, max: 0 },
     });
 
     h.connector.states.clear();

@@ -33,11 +33,17 @@ import { EventType } from '../events/schema.js';
 import { InstanceState, type InstanceStateValue, type WhatsAppConnector } from './instance.js';
 import { classifyDisconnect, disconnectStatusCode } from './disconnect.js';
 import { ReconnectScheduler } from './reconnectScheduler.js';
+import type { InstanceLock } from '../store/instanceLock.js';
+
+/** How often the held lock's TTL is renewed while a socket is live (architecture §11.3). */
+const LOCK_REFRESH_INTERVAL_MS = 10_000;
 
 export interface BaileysConnectorDeps {
   sessionRoot: string;
   qr: QrWriter;
   outbox: EventSink;
+  /** Single-owner instance lock (architecture §11.3) — see store/instanceLock.ts. */
+  lock: InstanceLock;
   /**
    * Who owns this instance. Backed by the manifest, so the connector never
    * holds a second copy of ownership that could drift from the registry's.
@@ -86,6 +92,8 @@ interface Runtime {
   watchdog: NodeJS.Timeout | undefined;
   /** The reconnection budget and its armed timer. See reconnectScheduler.ts. */
   reconnect: ReconnectScheduler;
+  /** Renews the instance lock while a socket is live. See #closeSocket. */
+  lockRefreshTimer: NodeJS.Timeout | undefined;
 }
 
 function newRuntime(reconnect: ReconnectScheduler): Runtime {
@@ -103,6 +111,7 @@ function newRuntime(reconnect: ReconnectScheduler): Runtime {
     starting: undefined,
     watchdog: undefined,
     reconnect,
+    lockRefreshTimer: undefined,
   };
 }
 
@@ -291,7 +300,55 @@ export class BaileysConnector implements WhatsAppConnector {
       return runtime.state;
     }
 
-    await this.#closeSocket(runtime, { deliberate: true });
+    await this.#closeSocket(instanceId, runtime, { deliberate: true });
+
+    // Single-owner lock (architecture §11.3): acquired BEFORE the auth state
+    // is even read, because creds.json is exactly the file two processes
+    // racing here would corrupt. A process that cannot acquire it refuses to
+    // start this socket — logged at error, since in a correctly-run MVP
+    // (exactly one gateway container) this should never happen, and if it
+    // does fire it means two containers are live for the same instance.
+    const acquiredLock = await this.#deps.lock.acquire(instanceId);
+    if (!acquiredLock) {
+      runtime.lastErrorCode = 'lock_contention';
+      log.error(
+        { status: 'error' },
+        'instance_lock_held_by_another_process — refusing to open a second socket for this instance',
+      );
+
+      // Retried on the same bounded budget as any other transient failure,
+      // NOT parked in `failed` — because the common case is not a second
+      // container at all, it is this one restarting. `docker restart` (which
+      // deploy-vps.yml runs) gives the old process 10s by its own default,
+      // not the 30s stop_grace_period compose declares, so a shutdown that
+      // outruns that is SIGKILLed with its locks still held — and they then
+      // linger for the lock's own 30s TTL while the new container is already
+      // restoring. Failing terminally there would leave a studio's WhatsApp
+      // down until somebody pressed Reconnect, over a condition that clears
+      // itself inside one or two backoff steps. A genuine two-container
+      // conflict is still caught: the budget exhausts and #scheduleReconnect
+      // lands the instance in `failed` with reconnect_attempts_exhausted.
+      const schedule = this.#scheduleReconnect(instanceId, runtime, 'lock_contention');
+      await this.#emitDisconnected(instanceId, tenantId, 'lock_contention', schedule);
+      return runtime.state;
+    }
+    runtime.lockRefreshTimer = setInterval(() => {
+      void this.#deps.lock.refresh(instanceId).then((stillOwned) => {
+        if (stillOwned) return;
+        // Lost the lock without us releasing it — the TTL expired (a long
+        // GC pause, a Redis blip) and another process may now hold it.
+        // Continuing to run this socket risks the exact corruption the lock
+        // exists to prevent, so it is closed rather than left running
+        // unprotected. #closeSocket clears this same timer and best-effort
+        // releases the lock, which is a safe no-op since we no longer own it.
+        log.error(
+          { status: 'error' },
+          'instance_lock_lost — closing this socket; another process may now own this instance',
+        );
+        void this.#closeSocket(instanceId, runtime, { deliberate: true });
+      });
+    }, LOCK_REFRESH_INTERVAL_MS);
+    runtime.lockRefreshTimer.unref();
 
     const dir = sessionDirFor(this.#deps.sessionRoot, instanceId);
     const auth = await useAtomicFileAuthState(dir, this.#deps.quarantineRoot);
@@ -441,7 +498,7 @@ export class BaileysConnector implements WhatsAppConnector {
     runtime.lastErrorCode = 'connect_timeout';
     runtime.disconnectedAt = new Date().toISOString();
 
-    await this.#closeSocket(runtime, { deliberate: true });
+    await this.#closeSocket(instanceId, runtime, { deliberate: true });
     await this.#deps.qr.clear(instanceId);
 
     // Retried through the same backoff loop as any other transient failure.
@@ -549,7 +606,7 @@ export class BaileysConnector implements WhatsAppConnector {
       runtime.state = InstanceState.QR_TIMEOUT;
       runtime.lastErrorCode = 'qr_timeout';
       await this.#deps.qr.clear(instanceId);
-      await this.#closeSocket(runtime, { deliberate: true });
+      await this.#closeSocket(instanceId, runtime, { deliberate: true });
       return;
     }
 
@@ -885,21 +942,37 @@ export class BaileysConnector implements WhatsAppConnector {
    * schedule a reconnect against it. The `closing` flag is what makes a
    * deliberate close distinguishable from WhatsApp hanging up on us.
    */
-  async #closeSocket(runtime: Runtime, options: { deliberate: boolean }): Promise<void> {
+  async #closeSocket(
+    instanceId: string,
+    runtime: Runtime,
+    options: { deliberate: boolean },
+  ): Promise<void> {
     this.#clearWatchdog(runtime);
 
-    const sock = runtime.sock;
-    if (!sock) return;
-
-    runtime.closing = options.deliberate;
-    runtime.sock = undefined;
-    try {
-      await sock.end(undefined);
-    } catch {
-      /* already gone; nothing to release */
-    } finally {
-      runtime.closing = false;
+    if (runtime.lockRefreshTimer) {
+      clearInterval(runtime.lockRefreshTimer);
+      runtime.lockRefreshTimer = undefined;
     }
+
+    const sock = runtime.sock;
+    if (sock) {
+      runtime.closing = options.deliberate;
+      runtime.sock = undefined;
+      try {
+        await sock.end(undefined);
+      } catch {
+        /* already gone; nothing to release */
+      } finally {
+        runtime.closing = false;
+      }
+    }
+
+    // Always attempted, not only when a socket existed: no live socket in
+    // this process for this instance means this process must not go on
+    // holding the lock, whatever state led here. release() is an ownership-
+    // checked no-op when this process never held it, so this is safe to call
+    // unconditionally rather than tracking a redundant "do we hold it" flag.
+    await this.#deps.lock.release(instanceId).catch(() => undefined);
   }
 
   async stop(instanceId: string): Promise<void> {
@@ -907,7 +980,7 @@ export class BaileysConnector implements WhatsAppConnector {
     // An operator disconnect must not be undone thirty seconds later by a
     // backoff timer armed before they pressed the button.
     runtime.reconnect.reset();
-    await this.#closeSocket(runtime, { deliberate: true });
+    await this.#closeSocket(instanceId, runtime, { deliberate: true });
     runtime.state = InstanceState.DISCONNECTED;
     runtime.disconnectedAt = new Date().toISOString();
     runtime.qrRound = 0;
@@ -933,7 +1006,7 @@ export class BaileysConnector implements WhatsAppConnector {
 
     runtime.reconnect.cancel();
     runtime.closing = true;
-    await this.#closeSocket(runtime, { deliberate: true });
+    await this.#closeSocket(instanceId, runtime, { deliberate: true });
     await this.#destroyCredentials(runtime);
 
     this.#runtimes.delete(instanceId);
@@ -969,11 +1042,11 @@ export class BaileysConnector implements WhatsAppConnector {
    */
   async shutdown(): Promise<void> {
     await Promise.all(
-      [...this.#runtimes.values()].map((runtime) => {
+      [...this.#runtimes.entries()].map(([instanceId, runtime]) => {
         // Cancel before closing: a timer that fires mid-shutdown would open a
         // new socket behind the teardown and leave it dangling.
         runtime.reconnect.cancel();
-        return this.#closeSocket(runtime, { deliberate: true }).catch(() => undefined);
+        return this.#closeSocket(instanceId, runtime, { deliberate: true }).catch(() => undefined);
       }),
     );
     this.#runtimes.clear();
