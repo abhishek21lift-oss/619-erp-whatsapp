@@ -738,6 +738,40 @@ Baileys `messages.update` acks map to the ERP's existing
 
 The existing vocabulary fits without alteration — §12.2.
 
+### 9.5 Addressing: a send to nobody looks exactly like a send
+
+`sock.sendMessage` does **not** fail for a JID that belongs to nobody. It
+resolves with a message key, indistinguishable from a real send — so the ERP
+records `sent`, stores the provider id, and shows a row that looks delivered.
+Nothing contradicts it, because the only thing that would is the delivery
+receipt that is never coming.
+
+This is not hypothetical. Production stored every client mobile as ten bare
+digits with no country code, `toJid` turned `8756562310` into
+`8756562310@s.whatsapp.net`, and **eight messages over eight days reached
+nobody** with eight `sent` rows to show for it. The tell was in the receipts:
+zero `whatsapp.message.delivered` events for any of those sends, while receipts
+for messages the owner typed by hand on the same account arrived normally under
+the phone app's own id format.
+
+Two independent guards, because each covers what the other cannot:
+
+1. **The ERP resolves the number before it leaves** —
+   `619-erp-backend`'s `src/modules/messaging/phone.js`, applied in
+   `transport.js` at the single point every send in the product passes
+   through. A national number gains its country code; a number of no
+   recognised shape is a **non-retryable failure before any provider is
+   touched**, never a guess. The rule is length-based, not "does it start with
+   the country code": Indian mobiles begin 6-9, so an ordinary national number
+   can begin `91` and a prefix test would send it to a stranger.
+2. **The gateway asks WhatsApp whether anyone has the number** —
+   `#assertOnWhatsApp` (a USync `onWhatsApp` query) before every send. This is
+   the one that covers the same bug with no code change behind it: one client's
+   number typed wrong. It fails **open** when the lookup cannot answer — a
+   USync blip must not stop a studio's messages — and **closed** only when
+   WhatsApp answers that nobody is there, as `RECIPIENT_NOT_ON_WHATSAPP`
+   (422, permanent, `will_retry: false`).
+
 ---
 
 ## 10. Media lifecycle
@@ -1072,7 +1106,10 @@ that should page. Both mean silent data loss.
 | `UNAUTHORIZED` | 401 | No |
 | `INSTANCE_NOT_FOUND` (incl. ownership mismatch) | 404 | No |
 | `INSTANCE_CONFLICT` (already exists / wrong state) | 409 | No |
+| `INSTANCE_NOT_CONNECTED` (no live socket to send on) | 409 | Yes, once the studio reconnects |
+| `DUPLICATE_MESSAGE` (same `client_message_id` in flight) | 409 | No — it would race the send already running |
 | `QR_EXPIRED` | 410 | Yes, after a new connect |
+| `RECIPIENT_NOT_ON_WHATSAPP` (§9.5) | 422 | No — the number will not be registered next attempt either |
 | `RATE_LIMITED` | 429 | Yes, honour `Retry-After` |
 | `UPSTREAM_UNAVAILABLE` (WhatsApp) | 502 | Yes |
 | `NOT_READY` (Redis/volume) | 503 | Yes |
@@ -1627,7 +1664,7 @@ Errors: `{ "error": { "code": "…", "message": "…" } }`.
 | `GET` | `/v1/instances/:id` | | `200 { instance }` |
 | `GET` | `/v1/instances/:id/qr` | | `200 { qr, expires_in_ms }` · `410 QR_EXPIRED` · `409` if connected |
 | `GET` | `/v1/instances/:id/status` | | `200 { state, phone_e164, connected_at, last_error_code }` |
-| `POST` | `/v1/instances/:id/messages` | `{ to: E.164, text, client_message_id }` — send one text | `200 { provider_message_id, duplicate }` · `409 INSTANCE_NOT_CONNECTED` · `409 DUPLICATE_MESSAGE` |
+| `POST` | `/v1/instances/:id/messages` | `{ to: E.164, text, client_message_id }` — send one text | `200 { provider_message_id, duplicate }` · `409 INSTANCE_NOT_CONNECTED` · `409 DUPLICATE_MESSAGE` · `422 RECIPIENT_NOT_ON_WHATSAPP` |
 | `POST` | `/v1/instances/:id/reconnect` | Resets the attempt counter | `202 { state: 'connecting' }` |
 | `POST` | `/v1/instances/:id/disconnect` | Closes the socket, **keeps** creds | `202 { state: 'disconnected' }` |
 | `DELETE` | `/v1/instances/:id` | Logs out, **destroys** creds | `204` |
