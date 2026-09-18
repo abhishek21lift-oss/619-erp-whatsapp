@@ -93,6 +93,13 @@ jobs:
               printf 'WA_CONNECTOR=baileys\n' >> /opt/myptstudio/.env
             fi
 
+            # Exported so the compose build args pick them up, which is what
+            # makes /healthz able to name the commit it is serving. Without
+            # this the sha reports "unknown" forever on the one machine where
+            # the question gets asked.
+            export GIT_SHA="$(git -C /opt/myptstudio/619-erp-whatsapp rev-parse HEAD)"
+            export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml config >/dev/null
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml build whatsapp
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml up -d whatsapp
@@ -131,5 +138,24 @@ jobs:
             docker inspect --format '{{json .NetworkSettings.Ports}}' myptstudio-whatsapp
             docker compose -f /opt/myptstudio/docker-compose.yml -f /opt/myptstudio/619-erp-whatsapp/deploy/compose.whatsapp.yml ps whatsapp
             docker exec myptstudio-whatsapp node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1);return r.json()}).then(console.log)"
+
+            # ── Deployment verification ──────────────────────────────────────
+            #
+            # "healthy" means the container answers /healthz. It does NOT mean
+            # the container is running the commit that was just built: a cached
+            # layer, a build that quietly failed and left the previous image in
+            # place, or a compose file resolving elsewhere all leave a healthy
+            # container serving yesterday's code, and the deploy reports
+            # success.
+            #
+            # So ask the running process which commit it IS, and refuse to call
+            # the deploy done unless it matches.
+            SERVING="$(docker exec myptstudio-whatsapp node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>r.json()).then(b=>console.log(b.release&&b.release.sha||''))" 2>/dev/null | tr -d '\r\n')"
+            if [ "$SERVING" != "$GIT_SHA" ]; then
+              echo "::error::deploy verification failed — expected $GIT_SHA, gateway reports '${SERVING:-no answer}'"
+              docker logs --tail 100 myptstudio-whatsapp || true
+              exit 1
+            fi
+            echo "deploy verified: gateway is serving $SERVING"
 
             printf '%s\n' '${{ github.event.workflow_run.head_sha || github.sha }}' > /opt/myptstudio/.whatsapp-deployed-sha

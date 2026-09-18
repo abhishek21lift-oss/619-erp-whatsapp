@@ -21,6 +21,7 @@ import { sweepQuarantine } from './store/sessionRecovery.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
+import { releaseInfo } from './release.js';
 
 /** How long the outbox sweeper waits between passes. See Outbox.reclaimStale. */
 const RECLAIM_INTERVAL_MS = 30_000;
@@ -54,7 +55,7 @@ async function main(): Promise<void> {
 
   const log = getLogger();
   log.info(
-    { version, node_env: config.NODE_ENV, port: config.PORT },
+    { ...releaseInfo(), node_env: config.NODE_ENV, port: config.PORT },
     'gateway_starting',
   );
 

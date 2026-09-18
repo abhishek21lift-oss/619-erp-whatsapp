@@ -30,6 +30,7 @@ function setup(options: {
   respond?: (call: number) => Response | Promise<Response>;
   maxAttempts?: number;
   now?: () => number;
+  random?: () => number;
 } = {}) {
   setLoggerForTesting(pino({ level: 'silent' }));
 
@@ -53,6 +54,7 @@ function setup(options: {
     retryMaxMs: 8_000,
     ...(options.maxAttempts !== undefined ? { maxAttempts: options.maxAttempts } : {}),
     ...(options.now ? { now: options.now } : {}),
+    ...(options.random ? { random: options.random } : {}),
   });
 
   return { redis, outbox, worker, calls };
@@ -240,25 +242,56 @@ describe('failed delivery', () => {
   });
 
   it('backs off further on each successive attempt', async () => {
+    // ── Why the jitter is pinned rather than rolled ────────────────────────
+    //
+    // This asserted that max(delay3, delay4) > min(delay1, delay2) against
+    // real Math.random, and it failed in CI: `expected 519 to be greater than
+    // 706`. That is not a bug in the backoff — it is the backoff working.
+    // Full jitter draws from [0, ceiling], so two late attempts CAN both roll
+    // near the floor while an early one rolls high. The assertion was a
+    // probabilistic claim about four samples, and it is false often enough to
+    // turn up in a run of twenty.
+    //
+    // backoffDelayMs has always accepted an injectable `random`; the worker
+    // simply never forwarded one. It does now, so the ceiling itself is
+    // observable: random() = 1 - epsilon makes each delay its own ceiling, and
+    // the schedule becomes exactly the thing this test is about.
+    //
+    // Stronger than what it replaces: EVERY step has to grow, and the growth
+    // has to be the documented doubling that saturates at retryMaxMs — not
+    // merely 'some later number exceeded some earlier one'.
     let clock = 1_000_000;
     const { outbox, worker, redis } = setup({
       respond: () => new Response('', { status: 500 }),
       maxAttempts: 5,
       now: () => clock,
+      // The top of the jitter window. Not 1: random() is specified as
+      // [0, 1), so the window is half-open and the largest delay it can
+      // produce is Math.floor(just-under-1 * ceiling) === ceiling - 1. The
+      // expectation below is written in those terms rather than round
+      // numbers, because ceiling - 1 is what the contract actually permits.
+      random: () => 1 - Number.EPSILON / 2,
     });
     await enqueueConnected(outbox);
 
-    const ceilings: number[] = [];
+    const delays: number[] = [];
     for (let i = 0; i < 4; i += 1) {
       await worker.tick();
       const entry = redis.zsets.get(keys.outboxRetry)?.[0];
-      if (entry) ceilings.push(entry.score - clock);
+      if (entry) delays.push(entry.score - clock);
       clock += 600_000;
     }
 
-    // Jitter means individual delays are not monotonic, but the reachable
-    // maximum must grow — otherwise the backoff is not backing off.
-    expect(Math.max(...ceilings.slice(2))).toBeGreaterThan(Math.min(...ceilings.slice(0, 2)));
+    // baseMs 1_000 doubling per attempt, capped at retryMaxMs 8_000, each
+    // one attempt's ceiling less the half-open window's final millisecond.
+    expect(delays).toEqual([999, 1_999, 3_999, 7_999]);
+
+    // And the property the old assertion was reaching for, now exactly:
+    // every step grows until the cap binds, and none exceeds it.
+    for (let i = 1; i < delays.length; i += 1) {
+      expect(delays[i]).toBeGreaterThan(delays[i - 1]!);
+    }
+    expect(Math.max(...delays)).toBeLessThan(8_000);
   });
 });
 

@@ -38,6 +38,17 @@ export interface DelivererOptions {
   /** Injected in tests. */
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /**
+   * The jitter source for retry scheduling. Must return [0, 1).
+   *
+   * backoffDelayMs has always taken one; the worker never passed it, so the
+   * only way to observe the backoff was to roll real dice and assert that the
+   * numbers came out roughly increasing. They do not always: full jitter draws
+   * from [0, ceiling], so a late attempt can legitimately land below an early
+   * one, and the test asserting otherwise failed about one run in twenty.
+   * Injecting it makes the schedule exactly assertable.
+   */
+  random?: () => number;
 }
 
 const DEFAULTS = {
@@ -62,6 +73,7 @@ export class DeliveryWorker {
   readonly #idlePollMs: number;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
+  readonly #random: () => number;
 
   #running = false;
   #loop: Promise<void> | undefined;
@@ -77,6 +89,7 @@ export class DeliveryWorker {
     this.#idlePollMs = options.idlePollMs ?? DEFAULTS.idlePollMs;
     this.#fetch = options.fetchImpl ?? fetch;
     this.#now = options.now ?? Date.now;
+    this.#random = options.random ?? Math.random;
   }
 
   get targetUrl(): string {
@@ -200,6 +213,7 @@ export class DeliveryWorker {
       const delayMs = backoffDelayMs(attempts, {
         baseMs: this.#retryBaseMs,
         maxMs: this.#retryMaxMs,
+        random: this.#random,
       });
       await this.#outbox.scheduleRetry(claimed, this.#now() + delayMs);
       log.warn(
