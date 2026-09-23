@@ -124,7 +124,7 @@ Network position is a defence, never the only one.
 
 ## 2. Request flow
 
-Worked example — a studio admin opens the WhatsApp card:
+Worked example — a studio's trainer opens the WhatsApp card:
 
 ```
 1. Browser   GET /api/integrations/whatsapp/status
@@ -169,7 +169,7 @@ stored on it. A wrong org cannot select a different instance; it can only fail.
 ### 3.1 Sequence
 
 ```
-Admin clicks "Connect WhatsApp"
+Trainer clicks "Connect WhatsApp"
         │
         ▼
 POST /api/integrations/whatsapp/connect        (backend, authenticated)
@@ -460,16 +460,20 @@ Justification: the product UX is "Connect WhatsApp", singular. A studio with two
 numbers is a real future case; it is not an MVP case, and the constraint is the
 cheapest way to make "which instance did they mean?" un-askable today.
 
-### 6.4 Super admin
+### 6.4 The platform operator
 
-A platform `super_admin` has **no** `organization_id`. Per `tenant-db.js`, they
-operate platform-wide unless they name a studio with `x-org-id`.
+A platform `super_admin` has **no** `organization_id` and **no** tenant access:
+the backend's auth middleware refuses a platform session on every tenant route,
+including `/api/integrations/whatsapp/*`, and the `x-org-id` header that used
+to point an operator at a studio is read nowhere any more (Trainer → Members
+role model, backend migration 208).
 
-For WhatsApp specifically: **connecting or disconnecting an instance requires a
-resolved org**. A platform-wide super admin gets `400 — Select a studio first`,
-exactly as `routes/integrations.js` already does in `writableOrg()`. Pairing a
-WhatsApp number is inherently a tenant action; there is no sensible
-platform-wide meaning for it.
+So connecting or disconnecting a studio's WhatsApp is done by that studio's
+trainer, and only by them. An operator supporting a studio does it through
+audited impersonation, which makes the request as the studio's trainer — the
+gateway still sees exactly one organization per call, asserted against the
+instance's stored owner. Pairing a WhatsApp number is inherently a tenant
+action; there is no platform-wide meaning for it.
 
 ---
 
