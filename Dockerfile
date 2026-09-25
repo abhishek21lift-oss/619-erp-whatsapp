@@ -2,14 +2,14 @@
 #
 # ── Why bookworm-slim and not Alpine ────────────────────────────────────────
 #
-# The ERP's backend image is node:20-bookworm-slim, and matching it means one
+# The ERP's backend image is node:22-bookworm-slim, and matching it means one
 # glibc to reason about across the stack rather than two. Baileys 7's Rust
 # dependency is WebAssembly, not a native addon — no `os`/`cpu` fields and no
 # platform-specific optional packages — so it needs no build toolchain and no
 # musl variant. Verified against the installed package, not assumed.
 
 # ── build: compile TypeScript ───────────────────────────────────────────────
-FROM node:20-bookworm-slim AS build
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 # `npm ci` and not `npm install`: the lockfile is the input, and a build that
@@ -31,13 +31,13 @@ RUN npm run build
 # So 162 packages that exist only to build and test never reach the running
 # container — and every one of them would otherwise be CVE surface in a service
 # that holds WhatsApp credentials and talks to a hostile network.
-FROM node:20-bookworm-slim AS deps
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # ── runtime ─────────────────────────────────────────────────────────────────
-FROM node:20-bookworm-slim AS runner
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 
 # Non-root. The session volume holds WhatsApp credentials — full account access
@@ -94,7 +94,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-# No tini / dumb-init. Node 20 installs its own SIGTERM handler and server.ts
+# No tini / dumb-init. Node installs its own SIGTERM handler and server.ts
 # uses it for the ordered teardown in §15.2 — an init shim would add a process
 # that forwards the signal and nothing else.
 CMD ["node", "dist/server.js"]

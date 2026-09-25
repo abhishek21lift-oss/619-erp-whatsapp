@@ -111,7 +111,7 @@ Network position is a defence, never the only one.
 
 | Concern | Choice | Why |
 |---|---|---|
-| Runtime | Node 20 (`node:20-bookworm-slim`) | Baileys requires `>=20`; matches the backend image exactly |
+| Runtime | Node 22 LTS (`node:22-bookworm-slim`) | Baileys requires `>=20`; Node 20 reached end-of-life in April 2026; matches the backend image exactly |
 | Language | **TypeScript** | Baileys is TS-first; its socket/event types are the main defence against protocol drift. The ERP stays CommonJS JS — the boundary is HTTP+JSON, so the language split costs nothing |
 | HTTP | **Fastify** | The ERP's Express app carries ~40 middleware layers this service does not want. Fastify's schema-per-route validation pairs directly with Zod, and it is faster under the long-lived connections this process holds. No shared code with the ERP is lost — there is none to share |
 | WhatsApp | `baileys` **pinned exactly** | See §21.1 for the version decision |
@@ -1127,7 +1127,7 @@ that should page. Both mean silent data loss.
 
 ```dockerfile
 # ── build ──────────────────────────────────────────────────────────────
-FROM node:20-bookworm-slim AS build
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci                      # dev deps needed to compile TS
@@ -1136,13 +1136,13 @@ COPY src ./src
 RUN npm run build               # → dist/
 
 # ── deps (production only) ─────────────────────────────────────────────
-FROM node:20-bookworm-slim AS deps
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # ── runtime ────────────────────────────────────────────────────────────
-FROM node:20-bookworm-slim AS runner
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 RUN groupadd --system --gid 1001 nodejs \
  && useradd  --system --uid 1001 --gid nodejs wa \
@@ -1160,7 +1160,7 @@ CMD ["node", "dist/server.js"]
 
 Notes on choices that are not arbitrary:
 
-- **`bookworm-slim`, not Alpine.** The backend uses `node:20-bookworm-slim`;
+- **`bookworm-slim`, not Alpine.** The backend uses `node:22-bookworm-slim`;
   matching the base means one glibc to reason about. Baileys 7's Rust
   dependency is **WebAssembly**, not a native addon (no `os`/`cpu` fields, no
   platform-specific optional deps), so it needs no build toolchain and no musl
@@ -1168,7 +1168,7 @@ Notes on choices that are not arbitrary:
   is the single fact that would most change this Dockerfile.
 - **Healthcheck uses `node -e` + `fetch`, not `curl`.** The backend's image
   calls `curl`, which `slim` does not ship — adding it is an unnecessary package
-  in a production image when Node 20 has global `fetch`.
+  in a production image when Node has global `fetch`.
 - **If `baileys@6.7.24` is chosen instead of 7.x**, the build stage additionally
   needs `git`, because 6.7.24 resolves `libsignal` from a raw git URL. §21.1.
 - **No secrets in the image.** Every value comes from the environment.
