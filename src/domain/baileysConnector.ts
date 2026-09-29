@@ -634,6 +634,15 @@ export class BaileysConnector implements WhatsAppConnector {
       runtime.lastErrorCode = 'qr_timeout';
       await this.#deps.qr.clear(instanceId);
       await this.#closeSocket(instanceId, runtime, { deliberate: true });
+      // Tell the ERP, as the pairing-rounds path below does. A deliberate
+      // close makes the close handler stand down, so without this nothing
+      // reported the timeout: the backend's row stayed `connecting` for good
+      // (production: one studio showed "connecting" for days after walking
+      // away from the QR dialog).
+      await this.#emitDisconnected(instanceId, tenantId, 'qr_timeout', {
+        willRetry: false,
+        nextRetryAt: null,
+      });
       return;
     }
 

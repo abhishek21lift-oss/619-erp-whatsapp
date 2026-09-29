@@ -271,6 +271,22 @@ describe('the pairing budget still bounds it', () => {
     expect(connector.stateOf(INSTANCE)).toBe(InstanceState.QR_TIMEOUT);
   });
 
+  it('tells the ERP too when one socket runs out of QR rounds', async () => {
+    // The other way to give up: WhatsApp keeps offering codes on ONE socket
+    // past qrMaxRounds. That path closed the socket deliberately — which
+    // silences the close handler — and reported nothing, so the ERP showed
+    // the studio as "connecting" indefinitely.
+    const connector = build({ qrMaxRounds: 2 });
+    await connector.start(INSTANCE);
+    await socket(0).emit({ qr: 'code-1' });
+    await socket(0).emit({ qr: 'code-2' });
+    await socket(0).emit({ qr: 'code-3' });
+    await settle();
+
+    expect(connector.stateOf(INSTANCE)).toBe(InstanceState.QR_TIMEOUT);
+    expect(events).toContain('whatsapp.instance.disconnected');
+  });
+
   it('gives a fresh budget when an operator asks to pair again', async () => {
     // Otherwise qr_timeout is permanent and the Connect button is a lie —
     // which is precisely the dead end the backend's /connect fix exists to
