@@ -45,7 +45,7 @@ be up is a security test that will one day be quietly skipped.
 
 | Suite | Result |
 |---|---|
-| Gateway | **154 passed**, 14 files |
+| Gateway | **226 passed**, 20 files |
 | Backend | **2696 passed**, 199 suites — plus 1 pre-existing failure, see below |
 | Frontend | **1886 passed**, 140 files |
 

@@ -57,7 +57,7 @@ feature flag is still off, with no socket reaching WhatsApp.
 ```bash
 npm install
 npm run dev        # tsx watch, reads .env
-npm test           # 154 tests, no Redis or WhatsApp needed
+npm test           # 226 tests, no Redis or WhatsApp needed
 npm run typecheck
 npm run lint
 npm run build      # → dist/
