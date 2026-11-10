@@ -22,6 +22,14 @@ export const keys = {
   outbox: `${KEY_PREFIX}outbox`,
   outboxProcessing: `${KEY_PREFIX}outbox:processing`,
   /**
+   * When each in-flight event was claimed, keyed by its raw JSON.
+   *
+   * Reclaiming by `enqueued_at` measured how long an event had EXISTED, not how
+   * long it had been in processing: an event that waited out a restart in the
+   * main queue was swept away mid-delivery as soon as it started.
+   */
+  outboxClaimed: `${KEY_PREFIX}outbox:claimed`,
+  /**
    * Delayed retries, scored by when they are due.
    *
    * A ZSET rather than a list because a list has no notion of "not yet". The

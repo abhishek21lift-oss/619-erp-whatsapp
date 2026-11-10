@@ -144,7 +144,8 @@ export class DeliveryWorker {
     const { signature, timestamp } = signBody(body, this.#secret);
 
     let outcome: 'ok' | 'retry' | 'dead';
-    let detail: Record<string, unknown> = {};
+    // Assigned on every branch below before it is read.
+    let detail: Record<string, unknown>;
 
     try {
       const response = await this.#fetch(this.#url, {

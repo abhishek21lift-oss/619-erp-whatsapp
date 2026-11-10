@@ -160,7 +160,9 @@ export class Outbox implements EventSink {
     if (raw === null) return undefined;
 
     try {
-      return { raw, envelope: JSON.parse(raw) as Envelope };
+      const envelope = JSON.parse(raw) as Envelope;
+      await this.#redis.hset(keys.outboxClaimed, raw, String(Date.now()));
+      return { raw, envelope };
     } catch {
       // Unparseable: it can never be delivered, and leaving it in processing
       // means sweeping it forever. Dead-letter it where it is visible.
@@ -173,6 +175,7 @@ export class Outbox implements EventSink {
   /** Delivery succeeded — drop it from the processing list. */
   async ack(claimed: ClaimedEvent): Promise<void> {
     await this.#redis.lrem(keys.outboxProcessing, 1, claimed.raw);
+    await this.#redis.hdel(keys.outboxClaimed, claimed.raw);
   }
 
   /**
@@ -185,6 +188,7 @@ export class Outbox implements EventSink {
   async scheduleRetry(claimed: ClaimedEvent, dueAt: number): Promise<void> {
     const next: Envelope = { ...claimed.envelope, attempts: claimed.envelope.attempts + 1 };
     await this.#redis.lrem(keys.outboxProcessing, 1, claimed.raw);
+    await this.#redis.hdel(keys.outboxClaimed, claimed.raw);
     await this.#redis.zadd(keys.outboxRetry, dueAt, JSON.stringify(next));
   }
 
@@ -198,6 +202,7 @@ export class Outbox implements EventSink {
   async deadLetter(claimed: ClaimedEvent): Promise<void> {
     const final: Envelope = { ...claimed.envelope, attempts: claimed.envelope.attempts + 1 };
     await this.#redis.lrem(keys.outboxProcessing, 1, claimed.raw);
+    await this.#redis.hdel(keys.outboxClaimed, claimed.raw);
     await this.#redis.lpush(keys.outboxDead, JSON.stringify(final));
   }
 
@@ -230,13 +235,18 @@ export class Outbox implements EventSink {
         continue;
       }
 
-      if (now - envelope.enqueued_at < PROCESSING_RECLAIM_MS) continue;
+      // Fall back to enqueued_at for an entry claimed before this key existed
+      // (i.e. during the deploy that introduced it).
+      const claimedAt = Number(await this.#redis.hget(keys.outboxClaimed, raw))
+        || envelope.enqueued_at;
+      if (now - claimedAt < PROCESSING_RECLAIM_MS) continue;
 
       // LREM before LPUSH. The other order can duplicate the event if the
       // process dies between the two; this order can only lose the reclaim
       // attempt, which the next sweep repeats.
       const removed = await this.#redis.lrem(keys.outboxProcessing, 1, raw);
       if (removed > 0) {
+        await this.#redis.hdel(keys.outboxClaimed, raw);
         await this.#redis.lpush(keys.outbox, raw);
         reclaimed += 1;
       }

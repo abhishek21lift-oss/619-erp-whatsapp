@@ -15,8 +15,9 @@ type ZEntry = { member: string; score: number };
 export class FakeRedis {
   readonly lists = new Map<string, string[]>();
   readonly zsets = new Map<string, ZEntry[]>();
-  /** Set to make the next write throw, for the "outcome not recorded" path. */
-  failNextWrite = false;
+  readonly hashes = new Map<string, Map<string, string>>();
+  /** Set to make the next LREM throw, for the "outcome not recorded" path. */
+  failNextLrem = false;
 
   #list(key: string): string[] {
     let list = this.lists.get(key);
@@ -36,17 +37,9 @@ export class FakeRedis {
     return z;
   }
 
-  #maybeFail(): void {
-    if (this.failNextWrite) {
-      this.failNextWrite = false;
-      throw new Error('simulated redis failure');
-    }
-  }
-
   // LPUSH prepends; RPOPLPUSH takes from the tail. Together that is FIFO, which
   // is why the outbox drains oldest-first.
   lpush(key: string, value: string): Promise<number> {
-    this.#maybeFail();
     const list = this.#list(key);
     list.unshift(value);
     return Promise.resolve(list.length);
@@ -73,7 +66,10 @@ export class FakeRedis {
 
   /** Matches by VALUE, not by index — which is why `raw` must not be re-encoded. */
   lrem(key: string, count: number, value: string): Promise<number> {
-    this.#maybeFail();
+    if (this.failNextLrem) {
+      this.failNextLrem = false;
+      throw new Error('simulated redis failure');
+    }
     const list = this.#list(key);
     let removed = 0;
     const limit = count === 0 ? Infinity : Math.abs(count);
@@ -87,7 +83,6 @@ export class FakeRedis {
   }
 
   zadd(key: string, score: number, member: string): Promise<number> {
-    this.#maybeFail();
     const z = this.#zset(key);
     const existing = z.find((e) => e.member === member);
     if (existing) {
@@ -127,8 +122,29 @@ export class FakeRedis {
     return Promise.resolve(1);
   }
 
+  hset(key: string, field: string, value: string): Promise<number> {
+    let hash = this.hashes.get(key);
+    if (!hash) {
+      hash = new Map();
+      this.hashes.set(key, hash);
+    }
+    const isNew = !hash.has(field);
+    hash.set(field, value);
+    return Promise.resolve(isNew ? 1 : 0);
+  }
+
+  hget(key: string, field: string): Promise<string | null> {
+    return Promise.resolve(this.hashes.get(key)?.get(field) ?? null);
+  }
+
+  hdel(key: string, field: string): Promise<number> {
+    const hash = this.hashes.get(key);
+    if (!hash) return Promise.resolve(0);
+    return Promise.resolve(hash.delete(field) ? 1 : 0);
+  }
+
   del(key: string): Promise<number> {
-    const had = this.lists.delete(key) || this.zsets.delete(key);
+    const had = this.lists.delete(key) || this.zsets.delete(key) || this.hashes.delete(key);
     return Promise.resolve(had ? 1 : 0);
   }
 
