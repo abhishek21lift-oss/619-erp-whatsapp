@@ -29,8 +29,25 @@ services:
       WA_MAX_INSTANCES: ${WA_MAX_INSTANCES:-50}
       WA_QR_TTL_SEC: ${WA_QR_TTL_SEC:-60}
       WA_QR_MAX_ROUNDS: ${WA_QR_MAX_ROUNDS:-5}
+      WA_PAIRING_MAX_ROUNDS: ${WA_PAIRING_MAX_ROUNDS:-10}
       WA_CONNECT_TIMEOUT_MS: ${WA_CONNECT_TIMEOUT_MS:-45000}
       WA_CONNECTOR: ${WA_CONNECTOR:-baileys}
+      # Send pacing (anti-ban) and reconnect/retention policy. Without these
+      # keys an operator could set them in .env and the container would never
+      # see them — the same silent-default failure as the backend's
+      # ADMIN_DATABASE_URL. Defaults here mirror src/config.ts.
+      WA_SEND_DEDUPE_TTL_SEC: ${WA_SEND_DEDUPE_TTL_SEC:-21600}
+      WA_SEND_RATE_SUSTAINED_PER_MIN: ${WA_SEND_RATE_SUSTAINED_PER_MIN:-20}
+      WA_SEND_RATE_BURST: ${WA_SEND_RATE_BURST:-10}
+      WA_SEND_DAILY_CAP: ${WA_SEND_DAILY_CAP:-1000}
+      WA_SEND_JITTER_MIN_MS: ${WA_SEND_JITTER_MIN_MS:-1000}
+      WA_SEND_JITTER_MAX_MS: ${WA_SEND_JITTER_MAX_MS:-3000}
+      WA_RECONNECT_BASE_MS: ${WA_RECONNECT_BASE_MS:-2000}
+      WA_RECONNECT_MAX_MS: ${WA_RECONNECT_MAX_MS:-300000}
+      WA_RECONNECT_MAX_ATTEMPTS: ${WA_RECONNECT_MAX_ATTEMPTS:-10}
+      WA_QUARANTINE_RETENTION_DAYS: ${WA_QUARANTINE_RETENTION_DAYS:-7}
+      WA_RATE_LIMIT_MAX: ${WA_RATE_LIMIT_MAX:-100}
+      WA_RATE_LIMIT_WINDOW_MS: ${WA_RATE_LIMIT_WINDOW_MS:-60000}
 
     volumes:
       - whatsapp-sessions:/data
