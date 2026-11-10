@@ -317,12 +317,30 @@ describe('robustness', () => {
     const { outbox, redis, worker } = setup();
     await enqueueConnected(outbox);
 
-    redis.failNextWrite = true;
+    redis.failNextLrem = true;
     await expect(worker.tick()).resolves.toEqual({ didWork: true });
 
     expect((await outbox.depth()).processing).toBe(1);
     expect(await outbox.reclaimStale(Date.now() + 120_000)).toBe(1);
     expect((await outbox.depth()).pending).toBe(1);
+  });
+
+  it('measures staleness from the claim, not from the original enqueue time', async () => {
+    // An event can wait in the main queue for minutes (restart, backlog) and
+    // still be delivered promptly. Ageing it by enqueued_at reclaimed it while
+    // its delivery was in flight, handing the backend a duplicate.
+    const { outbox, redis } = setup();
+    await enqueueConnected(outbox);
+
+    const list = redis.lists.get(keys.outbox)!;
+    const envelope = JSON.parse(list[0]!);
+    envelope.enqueued_at = Date.now() - 10 * 60_000;
+    list[0] = JSON.stringify(envelope);
+
+    await outbox.claimNext();
+
+    expect(await outbox.reclaimStale()).toBe(0);
+    expect(await outbox.reclaimStale(Date.now() + 120_000)).toBe(1);
   });
 
   it('reports no work rather than throwing when Redis is unavailable', async () => {
