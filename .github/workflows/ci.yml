@@ -20,9 +20,17 @@ name: CI — Lint · Type-check · Test · Build
 
 on:
   push:
-    branches: [feature/whatsapp-gateway-mvp]
+    # `main` is listed so that renaming the default branch does not quietly
+    # turn CI off: a push filter that matches no branch produces no run and no
+    # failure, so the loss would be silent. Keep the current deploy branch too
+    # — it is the default branch today.
+    branches: [feature/whatsapp-gateway-mvp, main]
   pull_request:
-    branches: [feature/whatsapp-gateway-mvp]
+    # Every pull request, whichever branch it targets. The filter used to name
+    # the feature branch, which meant a PR opened against any of the other
+    # long-lived branches (fix/audit-remediation, feat/gateway-outbound-messages)
+    # got no lint, typecheck or test run at all — the checks list looked green
+    # because it was empty.
   # Manual re-run. Same reasoning as the backend's: GitHub does not fire
   # `push` workflows for commits authenticated with an app or bot token, so
   # such a commit would otherwise get no run at all.
