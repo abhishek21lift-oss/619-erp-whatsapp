@@ -122,8 +122,9 @@ works, to suit a service that has never run, is the wrong direction.
 ### 2.3 Paste the service in
 
 Copy the `whatsapp:` block from `deploy/compose.whatsapp.yml` into the
-`services:` map of `/opt/myptstudio/docker-compose.yml`, and the
-`whatsapp-sessions:` entry into its `volumes:` map.
+`services:` map of `/opt/myptstudio/docker-compose.yml`, the
+`myptstudio_network:` entry into its top-level `networks:` map (create the map
+if it has none), and the `whatsapp-sessions:` entry into its `volumes:` map.
 
 The service is `whatsapp` and its `container_name` is `myptstudio-whatsapp`,
 matching the box's existing convention (`backend` / `myptstudio-backend`). The
@@ -132,10 +133,31 @@ the backend resolves does not depend on Docker's container-name DNS behaviour â€
 which could not be tested in the build environment. Keep both. The service name
 is only what you type.
 
-The alias assumes the box's services sit on compose's implicit `default`
-network. If `/opt/myptstudio/docker-compose.yml` declares a named network,
-change `default:` in the fragment to match it, or this container lands on a
-different network and cannot reach `redis` or the backend at all.
+The fragment joins an **external** network keyed `myptstudio_network`, whose
+real name is `${WA_NETWORK_NAME}`. Set it in `/opt/myptstudio/.env` to the
+network the backend and Redis actually use, for example:
+
+```bash
+# the name docker compose config prints under networks:
+WA_NETWORK_NAME=myptstudio_default
+```
+
+The `install` stage of `.github/workflows/deploy-whatsapp.yml` now resolves this
+name automatically from `docker compose config` (falling back to
+`<project>_default` only when the file does not name one), and writes it to
+`.env`. If you paste by hand, do not guess: the gateway on the wrong network
+cannot reach `redis` or the backend at all.
+
+Set the backend address too, using the **container name** the backend actually
+runs under (the checked-in template uses `erp-api`; the production box uses
+`myptstudio-backend`):
+
+```bash
+WA_BACKEND_URL=http://myptstudio-backend:5000
+```
+
+The `install` stage derives it from `docker compose ps`; leave it unset only if
+the default in the fragment is correct for the box.
 
 Pasting rather than overlaying with `-f`: `deploy.yml` and `rollback.yml` both
 invoke a bare `docker compose`, so an overlay file is invisible to them unless
