@@ -30,6 +30,7 @@ import { RecoveryOutcome } from '../store/sessionRecovery.js';
 import type { QrWriter } from '../store/qr.js';
 import type { EventSink } from '../events/outbox.js';
 import { EventType } from '../events/schema.js';
+import { inboundEventsFor, type MessagesUpsertLike } from './inbound.js';
 import { InstanceState, type InstanceStateValue, type WhatsAppConnector } from './instance.js';
 import { classifyDisconnect, disconnectStatusCode } from './disconnect.js';
 import { ReconnectScheduler } from './reconnectScheduler.js';
@@ -472,6 +473,15 @@ export class BaileysConnector implements WhatsAppConnector {
     sock.ev.on('messages.update', (updates) => {
       void this.#onMessageReceipts(instanceId, updates).catch((err: Error) => {
         log.error({ err: err.message, status: 'error' }, 'message_receipt_handler_failed');
+      });
+    });
+
+    // A member's message arriving. The ERP is the system of record for the
+    // thread, so this is the one event that carries a body; the payload is
+    // normalised in domain/inbound.ts before it reaches the outbox.
+    sock.ev.on('messages.upsert', (upsert) => {
+      void this.#onInboundMessages(instanceId, upsert).catch((err: Error) => {
+        log.error({ err: err.message, status: 'error' }, 'inbound_message_handler_failed');
       });
     });
 
@@ -1028,6 +1038,38 @@ export class BaileysConnector implements WhatsAppConnector {
           payload: { provider_message_id: providerMessageId, read_at: at },
         });
       }
+    }
+  }
+
+  /**
+   * Enqueue one event per inbound message the normaliser accepts.
+   *
+   * The tenant is resolved first: an instance removed mid-flight has no
+   * tenant, and an event with no tenant is unroutable. Only ids and the
+   * message type are logged — the body and the phone number are exactly what
+   * this service must not retain outside the event it is forwarding.
+   */
+  async #onInboundMessages(instanceId: string, upsert: MessagesUpsertLike): Promise<void> {
+    const tenantId = this.#deps.resolveTenant(instanceId);
+    if (!tenantId) return;
+
+    const log = operationLogger({
+      instance_id: instanceId,
+      tenant_id: tenantId,
+      operation: 'connector.inbound_message',
+    });
+
+    for (const payload of inboundEventsFor(upsert)) {
+      await this.#deps.outbox.enqueue(EventType.MESSAGE_RECEIVED, {
+        instanceId,
+        tenantId,
+        payload,
+      });
+      log.info({
+        status: 'ok',
+        provider_message_id: payload.provider_message_id,
+        message_type: payload.message_type,
+      }, 'inbound_message_enqueued');
     }
   }
 
