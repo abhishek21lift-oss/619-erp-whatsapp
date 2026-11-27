@@ -29,6 +29,7 @@ export const EventType = {
   // holding a mapping here would be a second source of truth that outlives
   // this process badly. The ERP matches on communication_logs.external_id,
   // which it wrote when it received `sent`.
+  MESSAGE_RECEIVED: 'whatsapp.message.received',
   MESSAGE_SENT: 'whatsapp.message.sent',
   MESSAGE_DELIVERED: 'whatsapp.message.delivered',
   MESSAGE_READ: 'whatsapp.message.read',
@@ -83,11 +84,41 @@ export interface EventPayloads {
    * device has not necessarily seen it. The ERP records both separately for
    * that reason.
    *
-   * No message BODY, here or in any of the four. The text is already in
+   * No message BODY in any of the four receipt events. The text is already in
    * communication_logs on the ERP side; copying it into an event would put a
    * studio's client correspondence into this service's outbox, its retry ZSET
    * and the backend's request logs, none of which is a place it belongs.
    */
+  /**
+   * The one message event that DOES carry a body.
+   *
+   * The ERP is the system of record for the member's thread: it must store the
+   * text, so this service has to hand it over. That makes this payload the one
+   * exception to the no-body rule above, and it must never be written to this
+   * service's logs, outbox diagnostics or error messages — only the event
+   * envelope leaves the process.
+   *
+   * `from_phone` is digits only, with the JID domain and device suffix
+   * stripped. A LID-addressed chat resolves through `remoteJidAlt`; without an
+   * alt there is no phone to report and the message is not emitted.
+   */
+  [EventType.MESSAGE_RECEIVED]: {
+    provider_message_id: string;
+    from_phone: string;
+    push_name: string | null;
+    message_type:
+      | 'text'
+      | 'image'
+      | 'video'
+      | 'audio'
+      | 'document'
+      | 'sticker'
+      | 'location'
+      | 'contact'
+      | 'other';
+    text: string | null;
+    received_at: string;
+  };
   [EventType.MESSAGE_SENT]: {
     client_message_id: string;
     provider_message_id: string;
